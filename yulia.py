@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
 from urllib.parse import quote_plus
-
+from keep_alive import keep_alive
 import httpx
 import orjson
 from loguru import logger
@@ -2965,7 +2965,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("shutdown requested — bye 👋")
+    keep_alive()
+    while True:
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            logger.error(f"Crash: {e}")
