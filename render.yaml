@@ -1,0 +1,12 @@
+# Render Blueprint for Yulia Silent Hill Bot
+# This file tells Render how to build and run your bot as a Background Worker.
+services:
+  - type: worker
+    name: yulia-bot
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python yulia.py"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"

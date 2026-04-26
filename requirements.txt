@@ -1,0 +1,18 @@
+# Core dependencies
+httpx>=0.27.0
+orjson>=3.9.0
+loguru>=0.7.0
+Pillow>=10.0.0
+tenacity>=8.2.0
+emoji>=2.14.0
+kyodo>=1.5.2
+# Faster event loop on Linux (Render runs Linux; ignored on Windows)
+uvloop>=0.19.0; sys_platform != "win32"
+
+# REQUIRED: your custom Kyodo client library.
+# If kyodo is a local folder in this repo (e.g. ./kyodo with setup.py):
+#   -e ./kyodo
+# If you have a wheel file in the repo:
+#   ./kyodo-1.0.0-py3-none-any.whl
+# If you install it manually on Render, comment the line above and use
+# the shell command in the dashboard instead.
