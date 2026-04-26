@@ -6,6 +6,7 @@ tenacity>=8.2.0
 flask
 emoji>=2.14.0
 kyodo>=1.5.2
+requests
 
 uvloop>=0.19.0; sys_platform != "win32"
 
