@@ -8,6 +8,6 @@ emoji>=2.14.0
 kyodo>=1.5.2
 requests
 packaging
-
+google-genai
 uvloop>=0.19.0; sys_platform != "win32"
 
