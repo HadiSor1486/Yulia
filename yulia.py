@@ -31,7 +31,6 @@
 ║   9. Pixabay (with retry)                                        ║
   10. AI Image generation (Pollinations, free, no key)            ║
   11. DM helpers                                                  ║
-  12. البريد المجهول                                              ║
   13. برا السالفة Game (fair round-robin, locked, timed)          ║
   14. Connect Four — 4 in a row                                   ║
   15. Event handlers                                              ║
@@ -128,7 +127,6 @@ class Config:
     # ── Storage files ─────────────────────────────────────────────
     USER_DATA_FILE = "info.json"
     MEMBERS_FILE   = "members.json"
-    BARID_FILE     = "barid.json"
     HISTORY_FILE   = "history.json"
     LOG_FILE       = "yulia.log"
 
@@ -152,7 +150,6 @@ class Config:
 
     # ── Game timeouts (برا السالفة) ───────────────────────────────
     LOBBY_TIMEOUT_S   = 300
-    REVEAL_TIMEOUT_S  = 180
     VOTING_TIMEOUT_S  = 180
     MIN_PLAYERS       = 3
 
@@ -253,7 +250,6 @@ def ensure_data_files():
     files = {
         Config.USER_DATA_FILE: {},
         Config.MEMBERS_FILE:   {},
-        Config.BARID_FILE:     {},
         Config.HISTORY_FILE:   [],
     }
     for path, default in files.items():
@@ -729,13 +725,13 @@ async def detect_intent(message: str) -> dict:
         "  card  = the gothic ID card that contains name, age, country, quote\n"
         "  image = any request like 'send a picture of a cat', 'ابعثي صورة قطة', 'show me a sunset'\n\n"
         "JSON schema:\n"
-        "  kick     → {\"type\":\"kick\",\"target\":\"<who>\",\"delay\":<int>,\"countdown\":<bool>,\"announcement\":\"<text|null>\"}\n"
-        "  pfp      → {\"type\":\"pfp\",\"target\":\"<who|self>\"}\n"
-        "  card     → {\"type\":\"card\",\"target\":\"<who|self>\"}\n"
-        "  remember → {\"type\":\"remember\"}\n"
-        "  members  → {\"type\":\"members\"}\n"
-        "  image    → {\"type\":\"image\",\"keyword\":\"<subject in English, 1-3 words>\",\"is_nsfw\":<bool>}\n"
-        "  chat     → {\"type\":\"chat\"}\n\n"
+        '  kick     → {"type":"kick","target":"<who>","delay":<int>,"countdown":<bool>,"announcement":"<text|null>"}\n'
+        '  pfp      → {"type":"pfp","target":"<who|self>"}\n'
+        '  card     → {"type":"card","target":"<who|self>"}\n'
+        '  remember → {"type":"remember"}\n'
+        '  members  → {"type":"members"}\n'
+        '  image    → {"type":"image","keyword":"<subject in English, 1-3 words>","is_nsfw":<bool>}\n'
+        '  chat     → {"type":"chat"}\n\n'
         "For kick:\n"
         "  - countdown=true ONLY if the user explicitly asks for a countdown in the chat\n"
         "  - announcement = any specific message the user asks Yulia to send before kicking, otherwise null\n"
@@ -743,7 +739,7 @@ async def detect_intent(message: str) -> dict:
         "For image:\n"
         "  - keyword = the main subject translated to English (e.g. 'قطة' → 'cat', 'غروب الشمس' → 'sunset')\n"
         "  - is_nsfw = true if the request is sexual, explicit, or inappropriate for all ages\n\n"
-        f"Message: \"{message}\"\n"
+        f'Message: "{message}"\n'
         "JSON:"
     )
     raw = await _ai_request(system, user, max_tokens=80, temperature=0.0)
@@ -1185,184 +1181,52 @@ async def handle_paint_command(prompt: str, is_arabic: bool,
 # ══════════════════════════════════════════════════════════════════
 # 11. DM HELPERS
 # ══════════════════════════════════════════════════════════════════
-dm_cache: dict[str, str] = {}
-
-async def build_dm_cache():
-    try:
-        unread = await client.get_unread_chats()
-        for chat_id in unread.unreadChatIds:
-            if chat_id == Config.CHAT_ID:
-                continue
-            try:
-                msgs = await client.get_chat_messages(chat_id)
-                for msg in getattr(msgs, "messages", []):
-                    uid = getattr(msg.author, "userId", None)
-                    if uid and uid != client.userId:
-                        dm_cache[uid] = chat_id
-                        break
-            except Exception as e:
-                logger.debug(f"[dm] cache build failed for {chat_id}: {e}")
-    except Exception as e:
-        logger.warning(f"[dm] build_dm_cache failed: {e}")
-
-
 async def send_dm(user_id: str, message: str) -> bool:
-    await build_dm_cache()
-    chat_id = dm_cache.get(user_id)
-    if not chat_id:
-        logger.info(f"[dm] no DM channel found for {user_id}")
-        return False
+    """
+    1. start_direct_chat → get (Chat, ChatMessageList)
+    2. If bot left the chat (member.status != 0), rejoin via join_chat
+    3. send_message
+    """
     try:
+        result = await client.start_direct_chat(user_id, circleId=Config.CIRCLE_ID)
+        chat = result[0]
+        chat_id = chat.chatId
+
+        if not chat_id:
+            logger.warning("[dm] no chat_id returned")
+            return False
+
+        # Check if we left the chat and need to rejoin
+        member_status = None
+        with suppress(Exception):
+            member_status = chat.member.status
+        logger.debug(f"[dm] chat_id={chat_id} member.status={member_status}")
+
+        if member_status != 0:
+            logger.info(f"[dm] bot is not active in this chat (status={member_status}), rejoining…")
+            try:
+                await client.join_chat(chat_id)
+                logger.debug("[dm] join_chat OK")
+            except Exception as e:
+                logger.warning(f"[dm] join_chat failed: {e}")
+                try:
+                    await client.join_chat(chat_id, circleId=Config.CIRCLE_ID)
+                    logger.debug("[dm] join_chat with circleId OK")
+                except Exception as e2:
+                    logger.warning(f"[dm] join_chat with circleId also failed: {e2}")
+                    return False
+
         await client.send_message(chat_id, message, None)
+        logger.debug("[dm] send_message succeeded")
         return True
+
     except Exception as e:
-        logger.warning(f"[dm] send failed: {e}")
+        logger.warning(f"[dm] send_dm failed: {e}")
         return False
 
 
 # ══════════════════════════════════════════════════════════════════
-# 12. البريد المجهول — ANONYMOUS MAIL
-# ══════════════════════════════════════════════════════════════════
-def load_barid() -> dict:
-    return json_read(Config.BARID_FILE, {})
-
-def save_barid(data: dict):
-    try:
-        json_write(Config.BARID_FILE, data)
-    except Exception as e:
-        logger.exception(f"[barid] save error: {e}")
-
-def barid_generate_code(existing_codes: set) -> int:
-    available = [c for c in range(1, 101) if c not in existing_codes]
-    if not available:
-        while True:
-            c = random.randint(101, 9999)
-            if c not in existing_codes:
-                return c
-    return random.choice(available)
-
-def barid_find_user_by_code(data: dict, code: int) -> str | None:
-    for uid, info in data.items():
-        if info.get("code") == code:
-            return uid
-    return None
-
-async def handle_barid_commands(content: str, user_id: str, nickname: str,
-                                chat_id: str, circle_id: str) -> bool:
-    stripped = content.strip()
-
-    if stripped == "مشاركة بريد":
-        data = load_barid()
-        if user_id in data:
-            data[user_id]["nickname"] = nickname
-            save_barid(data)
-            code = data[user_id]["code"]
-            await client.send_message(chat_id,
-                f"لديك بالفعل بريد مسجل\nرقمك: {code}", circle_id)
-        else:
-            existing_codes = {info["code"] for info in data.values()}
-            code           = barid_generate_code(existing_codes)
-            data[user_id]  = {"code": code, "nickname": nickname, "messages": []}
-            save_barid(data)
-            await client.send_message(chat_id,
-                f"تم إنشاء البريد الخاص بك\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"رقمك: {code}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"ضع الرقم في البايو حتى يتمكن الآخرون من مراسلتك {nickname}",
-                circle_id)
-        return True
-
-    if stripped.startswith("مجهول "):
-        parts = stripped.split(None, 2)
-        if len(parts) < 3:
-            await client.send_message(chat_id,
-                "الصيغة الصحيحة: مجهول <رقم> <رسالة>", circle_id)
-            return True
-        try:
-            target_code = int(parts[1])
-        except ValueError:
-            await client.send_message(chat_id, "الرقم غير صحيح", circle_id)
-            return True
-        msg_text = parts[2].strip()
-        if not msg_text:
-            await client.send_message(chat_id, "الرسالة فارغة", circle_id)
-            return True
-        data       = load_barid()
-        target_uid = barid_find_user_by_code(data, target_code)
-        if not target_uid:
-            await client.send_message(chat_id, "البريد غير صحيح", circle_id)
-            return True
-        entry = f"رسالة مجهولة:\n{msg_text}\n─── ✉️ ──"
-        data[target_uid]["messages"].append(entry)
-        save_barid(data)
-        await client.send_message(chat_id, "تم إرسال الرسالة بنجاح 📮", circle_id)
-        return True
-
-    if stripped.startswith("راسلي "):
-        parts = stripped.split(None, 2)
-        if len(parts) < 3:
-            await client.send_message(chat_id,
-                "الصيغة الصحيحة: راسلي <رقم> <رسالة>", circle_id)
-            return True
-        try:
-            target_code = int(parts[1])
-        except ValueError:
-            await client.send_message(chat_id, "الرقم غير صحيح", circle_id)
-            return True
-        msg_text = parts[2].strip()
-        if not msg_text:
-            await client.send_message(chat_id, "الرسالة فارغة", circle_id)
-            return True
-        data       = load_barid()
-        target_uid = barid_find_user_by_code(data, target_code)
-        if not target_uid:
-            await client.send_message(chat_id, "البريد غير صحيح", circle_id)
-            return True
-        if user_id not in data:
-            await client.send_message(chat_id,
-                "يجب أن يكون لديك بريد مسجل أولاً\nاكتب: مشاركة بريد", circle_id)
-            return True
-        sender_code = data[user_id]["code"]
-        entry = f"رسالة من ({sender_code}) {nickname}:\n{msg_text}\n─── 💌 ──"
-        data[target_uid]["messages"].append(entry)
-        save_barid(data)
-        await client.send_message(chat_id, "تم إرسال الرسالة بنجاح 📮", circle_id)
-        return True
-
-    if stripped == "بريد":
-        data = load_barid()
-        if user_id not in data:
-            await client.send_message(chat_id,
-                "لا يوجد بريد مسجل لك\nاكتب: مشاركة بريد", circle_id)
-            return True
-        messages = data[user_id].get("messages", [])
-        if not messages:
-            await client.send_message(chat_id, "📨 لا يوجد رسائل جديدة", circle_id)
-            return True
-        count   = len(messages)
-        header  = f"📬 عندك {count} {'رسالة' if count == 1 else 'رسائل'}:\n\n"
-        divider = "\n\n━━━━━━━━━━━━━━━━━━\n\n"
-        await client.send_message(chat_id, header + divider.join(messages), circle_id)
-        data[user_id]["messages"] = []
-        save_barid(data)
-        return True
-
-    if stripped == "رقم بريدي":
-        data = load_barid()
-        if user_id not in data:
-            await client.send_message(chat_id,
-                "ما عندك بريد مسجل بعد\nاكتب: مشاركة بريد", circle_id)
-            return True
-        code = data[user_id]["code"]
-        await client.send_message(chat_id, f"رقم بريدك: {code}", circle_id)
-        return True
-
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════
-# 13. برا السالفة — GAME MODULE  (fair round-robin, locked, timed)
+# 12. برا السالفة — GAME MODULE  (fair round-robin, locked, timed)
 # ══════════════════════════════════════════════════════════════════
 
 BARRA_TOPICS = [
@@ -1392,7 +1256,6 @@ BARRA_TOPICS = [
 class BarraState:
     IDLE   = "idle"
     LOBBY  = "lobby"
-    REVEAL = "reveal"
     ACTIVE = "active"
     VOTING = "voting"
 
@@ -1418,7 +1281,6 @@ def barra_reset():
         "turn_index":   0,
         "votes":        {},
         "voted_ids":    set(),
-        "revealed_ids": set(),
         "started_at":   0.0,
     })
 
@@ -1536,82 +1398,41 @@ async def barra_start_reveal(chat_id: str, circle_id: str):
         impostor              = random.choice(players)
         barra["impostor_id"]  = impostor["userId"]
         barra["topic"]        = random.choice(BARRA_TOPICS)
-        barra["state"]        = BarraState.REVEAL
-        barra["revealed_ids"] = set()
+        barra["state"]        = BarraState.ACTIVE
+        barra["turn_index"]   = 0
 
-    await client.send_message(chat_id,
-        f"✅ اكتمل العدد! {len(barra['players'])} لاعبين جاهزين.\n\n"
-        f"👥 اللاعبون (الترتيب):\n{barra_build_player_list()}\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📩 الخطوة التالية:\n"
-        f"كل لاعب يروح للمحادثة الخاصة مع البوت\n"
-        f"ويبعث كلمة: *كشف*\n"
-        f"وراح يعرف دوره بشكل سري 🤫\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ عندكم {Config.REVEAL_TIMEOUT_S // 60} دقائق",
-        circle_id)
-
-    _arm_timeout(
-        Config.REVEAL_TIMEOUT_S, BarraState.REVEAL,
-        "⏱️ ما كل اللاعبين أرسلوا *كشف* في الوقت. تم إلغاء اللعبة.\n"
-        "ابدأ من جديد بكتابة: لعبة برا السالفة",
-    )
-
-
-async def barra_handle_kashf(user_id: str, dm_chat_id: str):
-    should_begin = False
-    reply: str | None = None
-
-    async with barra_lock:
-        if barra["state"] != BarraState.REVEAL:
-            return
-        player = barra_get_player(user_id)
-        if not player:
-            return
-        is_impostor = (user_id == barra["impostor_id"])
+    # DM each player their role automatically
+    topic_local = barra["topic"]
+    impostor_id_local = barra["impostor_id"]
+    for p in players:
+        uid = p["userId"]
+        is_impostor = (uid == impostor_id_local)
         if is_impostor:
-            reply = (
+            dm_text = (
                 "🕵️ أنت *برا السالفة* !\n\n"
                 "الجميع عندهم موضوع مشترك — أنت ما تعرفه.\n"
                 "استمع للأسئلة وجاوب بذكاء ولا تنكشف! 🤫"
             )
         else:
-            reply = (
-                f"🎯 الموضوع هو: *{barra['topic']}*\n\n"
+            dm_text = (
+                f"🎯 الموضوع هو: *{topic_local}*\n\n"
                 f"في شخص واحد ما يعرف الموضوع — هو *برا السالفة*.\n"
                 f"اسأل واجاوب بذكاء ولا تقول الموضوع صراحة! 🤐"
             )
-        already = user_id in barra["revealed_ids"]
-        barra["revealed_ids"].add(user_id)
-        if not already and len(barra["revealed_ids"]) >= len(barra["players"]):
-            should_begin = True
-
-    if reply is not None:
         try:
-            await client.send_message(dm_chat_id, reply, None)
+            await send_dm(uid, dm_text)
         except Exception as e:
-            logger.warning(f"[barra] kashf DM send failed: {e}")
+            logger.warning(f"[barra] failed to DM {p['nickname']}: {e}")
 
-    if should_begin:
-        await barra_begin_active()
-
-
-async def barra_begin_active():
-    async with barra_lock:
-        if barra["state"] != BarraState.REVEAL:
-            return
-        barra["state"]      = BarraState.ACTIVE
-        barra["turn_index"] = 0
-
-    await client.send_message(Config.CHAT_ID,
-        f"🎉 الكل استلم دوره! نبدأ اللعبة الآن.\n\n"
+    await client.send_message(chat_id,
+        f"✅ اكتمل العدد! {len(barra['players'])} لاعبين جاهزين.\n\n"
+        f"👥 اللاعبون (الترتيب):\n{barra_build_player_list()}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎙️ جولة الأسئلة:\n"
-        f"كل شخص يسأل اللي بعده سؤال واحد\n"
-        f"السؤال يكون عن الموضوع — بدون ذكره مباشرة!\n"
+        f"🎉 نبدأ اللعبة الآن!\n"
+        f"كل لاعب استلم دوره عبر الرسالة الخاصة.\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         + barra_turn_msg(),
-        Config.CIRCLE_ID)
+        circle_id)
 
 
 async def barra_next_turn(chat_id: str, circle_id: str):
@@ -2295,22 +2116,6 @@ async def on_join(message: ChatMessage):
 
 
 @client.event(EventType.ChatMessage)
-async def on_dm_message(message: ChatMessage):
-    """Private DM handler — used for game role reveal (كشف)."""
-    try:
-        content = (message.content or "").strip()
-        user_id = message.author.userId
-        chat_id = message.chatId
-        if chat_id == Config.CHAT_ID or user_id == client.userId:
-            return
-        dm_cache[user_id] = chat_id
-        if content == "كشف":
-            await barra_handle_kashf(user_id, chat_id)
-    except Exception as e:
-        logger.exception(f"[on_dm_message] error: {e}")
-
-
-@client.event(EventType.ChatMessage)
 async def on_message(message: ChatMessage):
     try:
         content    = (message.content or "").strip()
@@ -2324,7 +2129,7 @@ async def on_message(message: ChatMessage):
         if not content:
             return
         if chat_id != Config.CHAT_ID:
-            return  # DMs handled by on_dm_message
+            return  # DMs are no longer used for game commands
 
         # Persist every group message so Yulia can remember context
         history.add(nickname, user_id, content)
@@ -2626,60 +2431,6 @@ async def on_message(message: ChatMessage):
                     f"🌫️ أهلاً بك في المملكة, {target_nick}", circle_id)
             return
 
-        # ─ barid:<n> — Sor only: assign code via reply ──────────
-        if user_id == Config.SOR_ID:
-            _bm = re.match(r"^barid\s*:\s*(\d+)$", content.strip(), re.IGNORECASE)
-            if _bm:
-                new_code = int(_bm.group(1))
-                _reply_obj = (
-                    getattr(message, "replyMessage", None) or
-                    getattr(message, "replyTo",      None) or
-                    getattr(message, "reply",        None)
-                )
-                _target_uid = None
-                if _reply_obj:
-                    _auth = getattr(_reply_obj, "author", None)
-                    if _auth:
-                        _target_uid = getattr(_auth, "userId", None)
-                    if not _target_uid:
-                        _target_uid = getattr(_reply_obj, "userId",
-                                     getattr(_reply_obj, "uid", None))
-                if not _target_uid:
-                    await client.send_message(chat_id,
-                        "ردّ على رسالة الشخص وبعدين اكتب الأمر",
-                        circle_id, reply_message_id=msg_id)
-                    return
-                data = load_barid()
-                taken_by = barid_find_user_by_code(data, new_code)
-                if taken_by and taken_by != _target_uid:
-                    taken_nick = data[taken_by].get("nickname", taken_by)
-                    await client.send_message(chat_id,
-                        f"الرقم {new_code} محجوز من قبل {taken_nick}",
-                        circle_id, reply_message_id=msg_id)
-                    return
-                if _target_uid not in data:
-                    _nick = next(
-                        (m["nickname"] for m in members.values()
-                         if m["userId"] == _target_uid), _target_uid)
-                    data[_target_uid] = {"code": new_code, "nickname": _nick, "messages": []}
-                else:
-                    data[_target_uid]["code"] = new_code
-                    _nick_fresh = next(
-                        (m["nickname"] for m in members.values()
-                         if m["userId"] == _target_uid), None)
-                    if _nick_fresh:
-                        data[_target_uid]["nickname"] = _nick_fresh
-                save_barid(data)
-                display_nick = data[_target_uid].get("nickname", _target_uid)
-                await client.send_message(chat_id,
-                    f"تم تغيير رقم بريد {display_nick} إلى {new_code}",
-                    circle_id, reply_message_id=msg_id)
-                return
-
-        # ─ البريد المجهول commands ──────────────────────────────
-        if await handle_barid_commands(content, user_id, nickname, chat_id, circle_id):
-            return
-
         # ════════════════════════════════════════════════════
         # ■ YULIA TRIGGER (chat / intents)
         # ════════════════════════════════════════════════════
@@ -2810,12 +2561,6 @@ async def on_message(message: ChatMessage):
                 "card @user — شوف كارت شخص ثاني\n"
                 "edit id card — احذف وأعد الكارت\n"
                 "ai remaining — حالة الذكاء والطلبات المتبقية (Gemini + Groq)\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "البريد:\n"
-                "مشاركة بريد — احصل على رقم بريد خاص\n"
-                "مجهول <رقم> <رسالة> — رسالة مجهولة\n"
-                "بريد — اعرض رسائلك (تُمسح بعد القراءة)\n"
-                "رقم بريدي — اعرف رقم بريدك\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 "لعبة برا السالفة — ابدأ اللعبة\n"
                 "مشاركة — انضم للعبة\n"
