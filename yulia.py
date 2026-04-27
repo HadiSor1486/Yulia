@@ -87,7 +87,7 @@ class Config:
     SOR_ID    = os.getenv("YULIA_SOR_ID", "cmgxsk2b30nalpx3ffm07h9i9")
 
     # ── API keys ──────────────────────────────────────────────────
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "43295244-e6e0155a28f0dc11acd0938f4")
 
     # ── Card image settings ───────────────────────────────────────
@@ -116,14 +116,14 @@ class Config:
     USER_DATA_FILE = "info.json"
     MEMBERS_FILE   = "members.json"
     BARID_FILE     = "barid.json"
+    HISTORY_FILE   = "history.json"
     LOG_FILE       = "yulia.log"
 
     # ── Creature types for ID cards ───────────────────────────────
     CREATURE_TYPES = ["Angel", "Vampire", "Ghost", "Fairy", "Zombie", "Werewolf", "Demon"]
 
     # ── AI ────────────────────────────────────────────────────────
-    GROQ_MODEL                = "llama-3.3-70b-versatile"
-    CONVERSATION_MEMORY_LIMIT = 15
+    GEMINI_MODEL              = "gemini-1.5-flash-latest"
     AI_REQUEST_TIMEOUT        = 20
     HTTP_TIMEOUT              = 15
 
@@ -240,6 +240,7 @@ def ensure_data_files():
         Config.USER_DATA_FILE: {},
         Config.MEMBERS_FILE:   {},
         Config.BARID_FILE:     {},
+        Config.HISTORY_FILE:   [],
     }
     for path, default in files.items():
         if not os.path.exists(path):
@@ -277,23 +278,39 @@ class UserDatabase:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. CONVERSATION MEMORY
+# 5. CHAT HISTORY  (persistent, global, last 100 messages)
 # ══════════════════════════════════════════════════════════════════
-class ConversationMemory:
-    def __init__(self):
-        self.conversations: dict[str, list[dict]] = {}
+class ChatHistory:
+    def __init__(self, filename: str, max_entries: int = 100):
+        self.filename = filename
+        self.max_entries = max_entries
+        self._data: list[dict] = json_read(self.filename, [])
 
-    def add(self, user_id: str, user_msg: str, bot_response: str):
-        bucket = self.conversations.setdefault(user_id, [])
-        bucket.append({"user_msg": user_msg, "bot_response": bot_response})
-        if len(bucket) > Config.CONVERSATION_MEMORY_LIMIT:
-            del bucket[: len(bucket) - Config.CONVERSATION_MEMORY_LIMIT]
+    def _save(self):
+        try:
+            json_write(self.filename, self._data)
+        except Exception as e:
+            logger.exception(f"[history] save error: {e}")
 
-    def get(self, user_id: str) -> list[dict]:
-        return self.conversations.get(user_id, [])[-6:]
+    def add(self, username: str, user_id: str, content: str):
+        entry = {
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "username": username,
+            "user_id": user_id,
+            "content": content,
+        }
+        self._data.append(entry)
+        if len(self._data) > self.max_entries:
+            self._data = self._data[-self.max_entries:]
+        self._save()
 
-    def clear(self, user_id: str):
-        self.conversations.pop(user_id, None)
+    def get_formatted(self, limit: int = 100) -> str:
+        if not self._data:
+            return "(no history yet)"
+        lines = []
+        for entry in self._data[-limit:]:
+            lines.append(f"[{entry['time']}] {entry['username']}: {entry['content']}")
+        return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -346,6 +363,9 @@ async def scan_members():
             page_token = result.pagination.get("fwd") if result.pagination else None
             if not page_token:
                 break
+        stale_keys = [k for k in members if k not in found]
+        for k in stale_keys:
+            del members[k]
         members.update(found)
         save_members()
         logger.info(f"[members] scan complete — {len(members)} members")
@@ -372,7 +392,7 @@ def format_members_list() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. AI HELPERS  (Groq, with retry + structured logging)
+# 7. AI HELPERS  (Gemini, with retry + structured logging)
 # ══════════════════════════════════════════════════════════════════
 
 YULIA_SYSTEM_PROMPT = """You are Yulia (يوليا), a girl in a group chat called Silent Hill on the Kyodo app.
@@ -382,6 +402,7 @@ YOUR PERSONALITY:
 - Natural and casual — you talk like a real person texting friends, not a customer service bot.
 - Sometimes sarcastic but never mean. You don't lecture or moralize.
 - You're loyal to the group leader "sor". If someone disrespects him, you respond calmly and clearly. One or two sentences, not a speech.
+- NEVER use emojis in your replies unless the user explicitly asks you to use them.
 
 RESPONSE LENGTH — THIS IS CRITICAL:
 - Keep it short. 1 to 3 sentences maximum. Always.
@@ -389,16 +410,16 @@ RESPONSE LENGTH — THIS IS CRITICAL:
 - You are not a therapist, a teacher, or a debater. Just a girl in a chat.
 
 LANGUAGE RULES — FOLLOW THESE STRICTLY, NO EXCEPTIONS:
-- If the user writes in Arabic → you reply ONLY in Arabic. Plain, natural Arabic. No specific dialect, no slang. Just clear Arabic that anyone can understand.
-- If the user writes in English → you reply ONLY in English.
-- NEVER mix languages. NEVER reply in English to an Arabic message. NEVER reply in Arabic to an English message.
-- If the user mixes both → use whichever language dominates their message.
+- If the user triggered you with "yulia" or "y" → you reply ONLY in English.
+- If the user triggered you with "يوليا" or "ي" → you reply ONLY in Arabic.
+- NEVER mix languages. NEVER reply in English to an Arabic-triggered message. NEVER reply in Arabic to an English-triggered message.
+- The trigger language determines your output language, not the content of the user's message.
 
 CONTEXT AWARENESS — VERY IMPORTANT:
-- Messages arrive as: [username]: [their message]
-- Read the full message carefully before replying. Understand who said what and what they actually mean.
-- Sometimes people mention "yulia" or "يوليا" inside their message as a reference — that's just them talking, not a new trigger. Understand context.
-- If you don't fully understand what someone means, ask one short question. Don't guess and ramble.
+- You are provided with the recent chat history below. Use it to answer questions about what other users said, who did what, etc.
+- When someone asks about another user (e.g., "what did alex say?"), look through the history by matching names loosely. Names like "alex", "alex123", "ale1x", or "الكس" all refer to the same person if they appear in history with that nickname.
+- Messages in history are formatted as: [timestamp] username: message
+- If you don't know something because it's not in the history, just say so briefly. Don't guess.
 - Never repeat the sender's username in your reply.
 - Never start your reply with your own name.
 - NEVER write [name] or [username] bracket notation anywhere in your reply.
@@ -406,50 +427,66 @@ CONTEXT AWARENESS — VERY IMPORTANT:
 You are Yulia. Not an AI. Not a bot. Just Yulia.""".strip()
 
 
-class GroqError(Exception):
-    """Raised on a transient Groq failure that should be retried."""
+class GeminiError(Exception):
+    """Raised on a transient Gemini failure that should be retried."""
 
 
 @retry(
-    retry=retry_if_exception_type((GroqError,) + NETWORK_ERRORS),
+    retry=retry_if_exception_type((GeminiError,) + NETWORK_ERRORS),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
     reraise=False,
 )
-async def _groq_request(messages: list, max_tokens: int = 80, temperature: float = 0.0) -> str | None:
+async def _gemini_request(system_text: str, user_text: str, max_tokens: int = 160, temperature: float = 0.0) -> str | None:
     try:
+        api_key = Config.GEMINI_API_KEY
+        if not api_key:
+            logger.error("[gemini] GEMINI_API_KEY not set")
+            return None
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{Config.GEMINI_MODEL}:generateContent?key={api_key}"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_text}]},
+            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": temperature,
+            },
+        }
         client_h = await http()
         resp = await client_h.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {Config.GROQ_API_KEY}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":       Config.GROQ_MODEL,
-                "messages":    messages,
-                "max_tokens":  max_tokens,
-                "temperature": temperature,
-                "stream":      False,
-            },
+            url,
+            headers={"Content-Type": "application/json"},
+            json=payload,
             timeout=httpx.Timeout(Config.AI_REQUEST_TIMEOUT),
         )
         text = resp.text
         if resp.status_code == 429:
-            logger.warning(f"[groq] rate-limited: {text[:200]}")
+            logger.warning(f"[gemini] rate-limited: {text[:200]}")
             return None
         if resp.status_code >= 500:
-            raise GroqError(f"server {resp.status_code}: {text[:200]}")
+            raise GeminiError(f"server {resp.status_code}: {text[:200]}")
         if resp.status_code != 200:
-            logger.warning(f"[groq] HTTP {resp.status_code}: {text[:200]}")
+            logger.warning(f"[gemini] HTTP {resp.status_code}: {text[:200]}")
             return None
         data = orjson.loads(text)
-        return data["choices"][0]["message"]["content"].strip()
+        prompt_feedback = data.get("promptFeedback", {})
+        if prompt_feedback.get("blockReason"):
+            logger.warning(f"[gemini] blocked: {prompt_feedback}")
+            return None
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.warning("[gemini] no candidates")
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            logger.warning("[gemini] no parts")
+            return None
+        return parts[0].get("text", "").strip()
     except NETWORK_ERRORS as e:
-        logger.warning(f"[groq] transient error, will retry: {e}")
+        logger.warning(f"[gemini] transient error, will retry: {e}")
         raise
     except Exception as e:
-        logger.exception(f"[groq] unexpected error: {e}")
+        logger.exception(f"[gemini] unexpected error: {e}")
         return None
 
 
@@ -457,14 +494,15 @@ async def ai_match_name(query: str, name_list: list) -> str | None:
     if not name_list:
         return None
     names_str = "\n".join(name_list)
-    prompt = (
-        f"From this list of usernames:\n{names_str}\n\n"
-        f"Which one best matches this description or name: '{query}'?\n"
-        f"Reply with ONLY the exact username from the list, nothing else. "
-        f"No quotes, no punctuation, no explanation. "
-        f"If nothing is close enough, reply: NO_MATCH"
+    system = (
+        "You are a name matching assistant. "
+        "From the list of usernames below, pick the one that best matches the query. "
+        "Reply with ONLY the exact username from the list, nothing else. "
+        "No quotes, no punctuation, no explanation. "
+        "If nothing matches, reply exactly: NO_MATCH"
     )
-    result = await _groq_request([{"role": "user", "content": prompt}], max_tokens=40)
+    user = f"Usernames:\n{names_str}\n\nQuery: '{query}'"
+    result = await _gemini_request(system, user, max_tokens=40, temperature=0.0)
     if not result:
         return None
     cleaned = result.strip().strip('"').strip("'").strip("`").strip()
@@ -480,9 +518,11 @@ async def ai_match_name(query: str, name_list: list) -> str | None:
 
 
 async def detect_intent(message: str) -> dict:
-    prompt = (
-        "You are an intent classifier for a chat bot named Yulia.\n"
-        "Analyze the message below and return a JSON object — no markdown, no explanation.\n\n"
+    system = (
+        "You are an intent classifier for a chat bot named Yulia. "
+        "Analyze the message and return a JSON object — no markdown, no explanation, no extra text."
+    )
+    user = (
         "Rules:\n"
         "- If the message asks to kick/remove/ban/throw out a user → type=kick\n"
         "- If the message asks for a profile picture / pfp / photo / avatar / صورة of a USER → type=pfp\n"
@@ -513,7 +553,7 @@ async def detect_intent(message: str) -> dict:
         f"Message: \"{message}\"\n"
         "JSON:"
     )
-    raw = await _groq_request([{"role": "user", "content": prompt}], max_tokens=80)
+    raw = await _gemini_request(system, user, max_tokens=80, temperature=0.0)
     if not raw:
         return {"type": "chat"}
     try:
@@ -524,17 +564,22 @@ async def detect_intent(message: str) -> dict:
         return {"type": "chat"}
 
 
-async def get_ai_response(user_message: str, author_name: str,
-                          mem: ConversationMemory, user_id: str) -> str | None:
+async def get_ai_response(user_message: str, author_name: str, user_id: str, is_arabic: bool) -> str | None:
     try:
-        context = mem.get(user_id)
-        messages = [{"role": "system", "content": YULIA_SYSTEM_PROMPT}]
-        for ex in context:
-            messages.append({"role": "user",      "content": ex["user_msg"]})
-            messages.append({"role": "assistant", "content": ex["bot_response"]})
-        messages.append({"role": "user", "content": f"[{author_name}]: {user_message}"})
-
-        reply = await _groq_request(messages, max_tokens=160, temperature=0.75)
+        history_text = history.get_formatted(100)
+        lang = "Arabic" if is_arabic else "English"
+        system = (
+            YULIA_SYSTEM_PROMPT
+            + f"\n\nThe user triggered you using the '{lang}' trigger. "
+            + f"You MUST reply ONLY in {lang}."
+        )
+        user_prompt = (
+            f"Here is the recent chat history (last up to 100 messages). "
+            f"Use it to answer questions about what others said, and to maintain context:\n\n"
+            f"{history_text}\n\n"
+            f"Now respond to this new message:\n[{author_name}]: {user_message}"
+        )
+        reply = await _gemini_request(system, user_prompt, max_tokens=160, temperature=0.75)
         if not reply:
             return None
         for prefix in [f"[{author_name}]:", f"[{author_name}]", f"{author_name}:", "Yulia:", "يوليا:"]:
@@ -550,15 +595,13 @@ async def get_ai_response(user_message: str, author_name: str,
 
 async def translate_to_english(arabic_text: str) -> str | None:
     try:
-        prompt = (
-            "Translate this prompt into English for use with an AI image generator. "
+        system = (
+            "You are a translator. Translate the given text into English for use with an AI image generator. "
             "Return ONLY the English prompt, no quotes, no explanation, no extra text. "
-            "Keep it concise and visual. If it's already English, just return it as-is.\n\n"
-            f"Prompt: {arabic_text}"
+            "Keep it concise and visual. If it's already English, return it as-is."
         )
-        result = await _groq_request(
-            [{"role": "user", "content": prompt}], max_tokens=120, temperature=0.0
-        )
+        user = f"Text: {arabic_text}"
+        result = await _gemini_request(system, user, max_tokens=120, temperature=0.0)
         if not result:
             return None
         return result.strip().strip('"').strip("'").strip("`").strip()
@@ -1987,9 +2030,9 @@ async def c4_handle_move(user_id: str, nickname: str, col_num: int,
 # ══════════════════════════════════════════════════════════════════
 # BOT INSTANCES
 # ══════════════════════════════════════════════════════════════════
-client = Client(deviceId=Config.DEVICE_ID)
-db     = UserDatabase(Config.USER_DATA_FILE)
-memory = ConversationMemory()
+client  = Client(deviceId=Config.DEVICE_ID)
+db      = UserDatabase(Config.USER_DATA_FILE)
+history = ChatHistory(Config.HISTORY_FILE, max_entries=100)
 waiting: dict = {}
 
 QUESTIONS = [
@@ -2089,6 +2132,9 @@ async def on_message(message: ChatMessage):
             return
         if chat_id != Config.CHAT_ID:
             return  # DMs handled by on_dm_message
+
+        # Persist every group message so Yulia can remember context
+        history.add(nickname, user_id, content)
 
         content_low = content.lower()
 
@@ -2327,7 +2373,7 @@ async def on_message(message: ChatMessage):
                 f"Resets At:  {reset_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
                 f"Remaining:  {hours}h {minutes}m {seconds}s\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"Groq free tier resets daily at 00:00 UTC", circle_id)
+                f"Daily reset at 00:00 UTC", circle_id)
             return
 
         _wprefix = None
@@ -2557,7 +2603,6 @@ async def on_message(message: ChatMessage):
                 "البريد:\n"
                 "مشاركة بريد — احصل على رقم بريد خاص\n"
                 "مجهول <رقم> <رسالة> — رسالة مجهولة\n"
-                "راسلي <رقم> <رسالة> — رسالة باسمك\n"
                 "بريد — اعرض رسائلك (تُمسح بعد القراءة)\n"
                 "رقم بريدي — اعرف رقم بريدك\n"
                 "━━━━━━━━━━━━━━━━━━\n"
@@ -2846,9 +2891,9 @@ async def handle_yulia_intent(
         return
 
     # CHAT (default)
-    reply = await get_ai_response(user_msg, author_name, memory, author_id)
+    reply = await get_ai_response(user_msg, author_name, author_id, is_arabic)
     if reply:
-        memory.add(author_id, user_msg, reply)
+        history.add("Yulia", client.userId or "yulia", reply)
     else:
         reply = "ما قدرت أرد، جرب بعد شوي" if is_arabic else "couldn't respond, try again"
     await client.send_message(chat_id, reply, circle_id, reply_message_id=msg_id)
