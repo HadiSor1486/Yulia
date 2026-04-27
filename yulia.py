@@ -123,7 +123,7 @@ class Config:
     CREATURE_TYPES = ["Angel", "Vampire", "Ghost", "Fairy", "Zombie", "Werewolf", "Demon"]
 
     # ── AI ────────────────────────────────────────────────────────
-    GEMINI_MODEL              = "gemini-1.5-flash-latest"
+    GEMINI_MODEL = "gemini-2.5-flash"
     AI_REQUEST_TIMEOUT        = 20
     HTTP_TIMEOUT              = 15
 
