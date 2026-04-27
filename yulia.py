@@ -1,6 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║                YULIA — SILENT HILL BOT  (v2.2)                   ║
+║                YULIA — SILENT HILL BOT  (v2.3)                   ║
+║                                                                  ║
+║  CHANGES vs v2.2:                                                ║
+║   • NEW: Dual AI — Gemini + Groq fallback                        ║
+║       - Gemini is primary; Groq takes over when quota expires  ║
+║       - Both share the same chat history & context               ║
+║       - Set GROQ_API_KEY in Render env vars                      ║
+║   • Memory expanded: 100 → 200 messages                          ║
+║   • ai remaining now shows live status for both providers        ║
 ║                                                                  ║
 ║  CHANGES vs v2.1:                                                ║
 ║   • NEW: Connect Four — "4 in a row" / "أربعة على التوالي"       ║
@@ -87,8 +95,13 @@ class Config:
     SOR_ID    = os.getenv("YULIA_SOR_ID", "cmgxsk2b30nalpx3ffm07h9i9")
 
     # ── API keys ──────────────────────────────────────────────────
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+    GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
     PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "43295244-e6e0155a28f0dc11acd0938f4")
+
+    # ── AI daily limits (free-tier defaults; override via env if paid) ─
+    GEMINI_DAILY_LIMIT = int(os.getenv("GEMINI_DAILY_LIMIT", "60"))
+    GROQ_DAILY_LIMIT   = int(os.getenv("GROQ_DAILY_LIMIT", "1000"))
 
     # ── Card image settings ───────────────────────────────────────
     GOTHIC_BACKGROUND    = "gbg1.jpg"
@@ -124,6 +137,7 @@ class Config:
 
     # ── AI ────────────────────────────────────────────────────────
     GEMINI_MODEL = "gemini-2.5-flash"
+    GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     AI_REQUEST_TIMEOUT        = 20
     HTTP_TIMEOUT              = 15
 
@@ -278,10 +292,10 @@ class UserDatabase:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. CHAT HISTORY  (persistent, global, last 100 messages)
+# 5. CHAT HISTORY  (persistent, global, last 200 messages)
 # ══════════════════════════════════════════════════════════════════
 class ChatHistory:
-    def __init__(self, filename: str, max_entries: int = 100):
+    def __init__(self, filename: str, max_entries: int = 200):
         self.filename = filename
         self.max_entries = max_entries
         self._data: list[dict] = json_read(self.filename, [])
@@ -395,6 +409,88 @@ def format_members_list() -> str:
 # 7. AI HELPERS  (Gemini, with retry + structured logging)
 # ══════════════════════════════════════════════════════════════════
 
+
+# ── AI Provider Manager (Gemini primary, Groq fallback) ──────────
+class AIProviderManager:
+    """Tracks usage & health of Gemini & Groq. Gemini is primary; Groq is fallback."""
+
+    def __init__(self):
+        self.gemini_requests = 0
+        self.groq_requests = 0
+        self.gemini_failures = 0
+        self.groq_failures = 0
+        self.gemini_available = True
+        self.groq_available = True
+        self.active_provider = "gemini"
+        self.last_reset = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _check_reset(self):
+        now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        if now > self.last_reset:
+            self.gemini_requests = 0
+            self.groq_requests = 0
+            self.gemini_failures = 0
+            self.groq_failures = 0
+            self.gemini_available = True
+            self.groq_available = True
+            self.active_provider = "gemini"
+            self.last_reset = now
+            logger.info("[ai_manager] daily counters reset")
+
+    def record_gemini_attempt(self):
+        self._check_reset()
+        self.gemini_requests += 1
+
+    def record_groq_attempt(self):
+        self._check_reset()
+        self.groq_requests += 1
+
+    def record_gemini_fail(self):
+        self.gemini_failures += 1
+        if self.gemini_failures >= 3:
+            self.gemini_available = False
+
+    def record_groq_fail(self):
+        self.groq_failures += 1
+        if self.groq_failures >= 3:
+            self.groq_available = False
+
+    def record_gemini_success(self):
+        self.gemini_available = True
+        self.gemini_failures = 0
+        self.active_provider = "gemini"
+
+    def record_groq_success(self):
+        self.groq_available = True
+        self.groq_failures = 0
+        self.active_provider = "groq"
+
+    def get_status(self) -> dict:
+        self._check_reset()
+        gemini_limit = Config.GEMINI_DAILY_LIMIT
+        groq_limit   = Config.GROQ_DAILY_LIMIT
+        gemini_remaining = max(0, gemini_limit - self.gemini_requests)
+        groq_remaining   = max(0, groq_limit - self.groq_requests)
+        return {
+            "gemini": {
+                "used": self.gemini_requests,
+                "remaining": gemini_remaining,
+                "active": self.gemini_available,
+                "limit": gemini_limit,
+            },
+            "groq": {
+                "used": self.groq_requests,
+                "remaining": groq_remaining,
+                "active": self.groq_available,
+                "limit": groq_limit,
+            },
+            "primary": self.active_provider,
+        }
+
+
+ai_manager = AIProviderManager()
+
+
 YULIA_SYSTEM_PROMPT = """You are Yulia (يوليا), a girl in a group chat called Silent Hill on the Kyodo app.
 
 YOUR PERSONALITY:
@@ -490,6 +586,103 @@ async def _gemini_request(system_text: str, user_text: str, max_tokens: int = 16
         return None
 
 
+# ── Groq request (fallback) ─────────────────────────────────────
+class GroqError(Exception):
+    """Raised on a transient Groq failure that should be retried."""
+
+
+@retry(
+    retry=retry_if_exception_type((GroqError,) + NETWORK_ERRORS),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    reraise=False,
+)
+async def _groq_request(system_text: str, user_text: str, max_tokens: int = 160, temperature: float = 0.0) -> str | None:
+    try:
+        api_key = Config.GROQ_API_KEY
+        if not api_key:
+            logger.error("[groq] GROQ_API_KEY not set")
+            return None
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": Config.GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        client_h = await http()
+        resp = await client_h.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=httpx.Timeout(Config.AI_REQUEST_TIMEOUT),
+        )
+        text = resp.text
+        if resp.status_code == 429:
+            logger.warning(f"[groq] rate-limited: {text[:200]}")
+            return None
+        if resp.status_code >= 500:
+            raise GroqError(f"server {resp.status_code}: {text[:200]}")
+        if resp.status_code != 200:
+            logger.warning(f"[groq] HTTP {resp.status_code}: {text[:200]}")
+            return None
+        data = orjson.loads(text)
+        choices = data.get("choices", [])
+        if not choices:
+            logger.warning("[groq] no choices")
+            return None
+        msg = choices[0].get("message", {})
+        if not msg:
+            logger.warning("[groq] no message")
+            return None
+        return msg.get("content", "").strip()
+    except NETWORK_ERRORS as e:
+        logger.warning(f"[groq] transient error, will retry: {e}")
+        raise
+    except Exception as e:
+        logger.exception(f"[groq] unexpected error: {e}")
+        return None
+
+
+# ── Smart AI router (Gemini first, Groq fallback) ────────────────
+async def _ai_request(system_text: str, user_text: str, max_tokens: int = 160, temperature: float = 0.0) -> str | None:
+    """Primary AI request router. Gemini first, Groq fallback. Both share the same history/context."""
+    # Try Gemini first
+    if ai_manager.gemini_available and Config.GEMINI_API_KEY:
+        ai_manager.record_gemini_attempt()
+        result = await _gemini_request(system_text, user_text, max_tokens, temperature)
+        if result:
+            ai_manager.record_gemini_success()
+            return result
+        ai_manager.record_gemini_fail()
+        logger.warning("[ai] Gemini failed (quota or error), attempting Groq fallback...")
+    else:
+        if not Config.GEMINI_API_KEY:
+            logger.debug("[ai] GEMINI_API_KEY missing, skipping to Groq")
+        else:
+            logger.warning("[ai] Gemini marked unavailable, using Groq")
+
+    # Fallback to Groq
+    if ai_manager.groq_available and Config.GROQ_API_KEY:
+        ai_manager.record_groq_attempt()
+        result = await _groq_request(system_text, user_text, max_tokens, temperature)
+        if result:
+            ai_manager.record_groq_success()
+            return result
+        ai_manager.record_groq_fail()
+        logger.error("[ai] Groq fallback also failed")
+    else:
+        if not Config.GROQ_API_KEY:
+            logger.error("[ai] GROQ_API_KEY missing, no fallback available")
+        else:
+            logger.error("[ai] Groq marked unavailable, no provider left")
+
+    return None
+
+
 async def ai_match_name(query: str, name_list: list) -> str | None:
     if not name_list:
         return None
@@ -502,7 +695,7 @@ async def ai_match_name(query: str, name_list: list) -> str | None:
         "If nothing matches, reply exactly: NO_MATCH"
     )
     user = f"Usernames:\n{names_str}\n\nQuery: '{query}'"
-    result = await _gemini_request(system, user, max_tokens=40, temperature=0.0)
+    result = await _ai_request(system, user, max_tokens=40, temperature=0.0)
     if not result:
         return None
     cleaned = result.strip().strip('"').strip("'").strip("`").strip()
@@ -553,7 +746,7 @@ async def detect_intent(message: str) -> dict:
         f"Message: \"{message}\"\n"
         "JSON:"
     )
-    raw = await _gemini_request(system, user, max_tokens=80, temperature=0.0)
+    raw = await _ai_request(system, user, max_tokens=80, temperature=0.0)
     if not raw:
         return {"type": "chat"}
     try:
@@ -566,7 +759,7 @@ async def detect_intent(message: str) -> dict:
 
 async def get_ai_response(user_message: str, author_name: str, user_id: str, is_arabic: bool) -> str | None:
     try:
-        history_text = history.get_formatted(100)
+        history_text = history.get_formatted(200)
         lang = "Arabic" if is_arabic else "English"
         system = (
             YULIA_SYSTEM_PROMPT
@@ -574,12 +767,12 @@ async def get_ai_response(user_message: str, author_name: str, user_id: str, is_
             + f"You MUST reply ONLY in {lang}."
         )
         user_prompt = (
-            f"Here is the recent chat history (last up to 100 messages). "
+            f"Here is the recent chat history (last up to 200 messages). "
             f"Use it to answer questions about what others said, and to maintain context:\n\n"
             f"{history_text}\n\n"
             f"Now respond to this new message:\n[{author_name}]: {user_message}"
         )
-        reply = await _gemini_request(system, user_prompt, max_tokens=160, temperature=0.75)
+        reply = await _ai_request(system, user_prompt, max_tokens=160, temperature=0.75)
         if not reply:
             return None
         for prefix in [f"[{author_name}]:", f"[{author_name}]", f"{author_name}:", "Yulia:", "يوليا:"]:
@@ -601,7 +794,7 @@ async def translate_to_english(arabic_text: str) -> str | None:
             "Keep it concise and visual. If it's already English, return it as-is."
         )
         user = f"Text: {arabic_text}"
-        result = await _gemini_request(system, user, max_tokens=120, temperature=0.0)
+        result = await _ai_request(system, user, max_tokens=120, temperature=0.0)
         if not result:
             return None
         return result.strip().strip('"').strip("'").strip("`").strip()
@@ -2032,7 +2225,7 @@ async def c4_handle_move(user_id: str, nickname: str, col_num: int,
 # ══════════════════════════════════════════════════════════════════
 client  = Client(deviceId=Config.DEVICE_ID)
 db      = UserDatabase(Config.USER_DATA_FILE)
-history = ChatHistory(Config.HISTORY_FILE, max_entries=100)
+history = ChatHistory(Config.HISTORY_FILE, max_entries=200)
 waiting: dict = {}
 
 QUESTIONS = [
@@ -2360,20 +2553,38 @@ async def on_message(message: ChatMessage):
             return
 
         if content_low in ("ai remaining", "ai status"):
+            status = ai_manager.get_status()
             now        = datetime.now(timezone.utc)
             reset_time = (now + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0)
             remaining  = reset_time - now
             hours, rem        = divmod(remaining.seconds, 3600)
             minutes, seconds  = divmod(rem, 60)
+
+            gemini = status["gemini"]
+            groq   = status["groq"]
+            primary = status["primary"]
+
+            gemini_icon = "🟢" if gemini["active"] else "🔴"
+            groq_icon   = "🟢" if groq["active"] else "🔴"
+
             await client.send_message(chat_id,
-                f"Yulia AI Status\n"
+                f"🤖 Yulia AI Status\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"UTC Now:    {now.strftime('%H:%M:%S')}\n"
-                f"Resets At:  {reset_time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                f"Remaining:  {hours}h {minutes}m {seconds}s\n"
+                f"Active Provider: *{primary.upper()}*\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"Daily reset at 00:00 UTC", circle_id)
+                f"{gemini_icon} Gemini\n"
+                f"   Status: {'Online' if gemini['active'] else 'Stopped / Quota hit'}\n"
+                f"   Used: {gemini['used']}/{gemini['limit']}\n"
+                f"   Left: {gemini['remaining']} requests\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{groq_icon} Groq\n"
+                f"   Status: {'Online' if groq['active'] else 'Stopped / Quota hit'}\n"
+                f"   Used: {groq['used']}/{groq['limit']}\n"
+                f"   Left: {groq['remaining']} requests\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ Daily Reset: {hours}h {minutes}m {seconds}s\n"
+                f"Resets at {reset_time.strftime('%Y-%m-%d %H:%M')} UTC", circle_id)
             return
 
         _wprefix = None
@@ -2598,7 +2809,7 @@ async def on_message(message: ChatMessage):
                 "card — شوف كارتك\n"
                 "card @user — شوف كارت شخص ثاني\n"
                 "edit id card — احذف وأعد الكارت\n"
-                "ai remaining — وقت إعادة تعبئة الذكاء\n"
+                "ai remaining — حالة الذكاء والطلبات المتبقية (Gemini + Groq)\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 "البريد:\n"
                 "مشاركة بريد — احصل على رقم بريد خاص\n"
