@@ -1,33 +1,48 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║                YULIA — SILENT HILL BOT  (v2.2)                   ║
+║           YULIA — SILENT HILL BOT  (v3.0 — EVOLUTION)          ║
 ║                                                                  ║
-║  CHANGES vs v2.1:                                                ║
-║   • NEW: Connect Four — "4 in a row" / "أربعة على التوالي"       ║
-║       - Reply-to-challenge: reply to a user with the command     ║
-║       - 7 columns × 6 rows, drop emojis by typing 1–7            ║
-║       - Each player picks their own emoji (must be different)    ║
-║       - Detects horizontal / vertical / diagonal wins            ║
-║       - Host can end game with "انهاء اللعبة"                    ║
-║       - Auto-reset on win / draw — challenge again to replay     ║
+║  CHANGES vs v2.2:                                                ║
+║   • MEMORY REVOLUTION — Yulia remembers EVERYTHING forever       ║
+║       - Full group chat history persisted to JSON                ║
+║       - Answers "who said what", "what happened after..."        ║
+║       - Per-user memory profiles with unlimited depth            ║
+║                                                                  ║
+║   • ARABIC EVOLUTION — Yulia learns and adapts her Arabic        ║
+║       - Tracks slang, expressions, and style from users          ║
+║       - Gradually speaks more like the group over time           ║
+║       - Arabic trigger: يوليا / ي  |  English trigger: yulia / y ║
+║                                                                  ║
+║   • HYBRID INTELLIGENCE — Less Groq dependency                   ║
+║       - Pattern-matches common questions locally                 ║
+║       - Memory-aware responses without AI calls                  ║
+║       - Groq reserved for nuance, creativity, and depth          ║
+║                                                                  ║
+║   • SELF-AWARENESS — Yulia knows she's Yulia in Silent Hill      ║
+║       - Host is "sor" — loyal, protective, casual                ║
+║       - No language detection — trigger defines language           ║
+║                                                                  ║
+║   • Connect Four — host can end game with "انهاء اللعبة" anytime  ║
 ║                                                                  ║
 ║  MODULES:                                                        ║
 ║   1. Config & secrets                                            ║
 ║   2. Logging                                                     ║
 ║   3. Network (shared httpx AsyncClient)                          ║
 ║   4. UserDatabase    — atomic JSON storage                       ║
-║   5. ConversationMemory                                          ║
-║   6. Members store                                               ║
-║   7. AI helpers (Groq, with retry)                               ║
-║   8. Image helpers (PIL)                                         ║
-║   9. Pixabay (with retry)                                        ║
-  10. AI Image generation (Pollinations, free, no key)            ║
-  11. DM helpers                                                  ║
-  12. البريد المجهول                                              ║
-  13. برا السالفة Game (fair round-robin, locked, timed)          ║
-  14. Connect Four — 4 in a row                                   ║
-  15. Event handlers                                              ║
-  16. Main (with auto-restart loop)                               ║
+║   5. GroupMemory     — PERSISTENT unlimited chat memory          ║
+║   6. ArabicEvolution — learns Arabic style over time             ║
+║   7. HybridResponder — local pattern intelligence                  ║
+║   8. Members store                                               ║
+║   9. AI helpers (Groq, with retry)                               ║
+║  10. Image helpers (PIL)                                         ║
+║  11. Pixabay (with retry)                                        ║
+║  12. AI Image generation (Pollinations, free, no key)            ║
+║  13. DM helpers                                                  ║
+║  14. البريد المجهول                                              ║
+║  15. برا السالفة Game (fair round-robin, locked, timed)          ║
+║  16. Connect Four — 4 in a row                                   ║
+║  17. Event handlers                                              ║
+║  18. Main (with auto-restart loop)                               ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -41,6 +56,7 @@ import signal
 import sys
 import tempfile
 import time
+import unicodedata
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -118,12 +134,18 @@ class Config:
     BARID_FILE     = "barid.json"
     LOG_FILE       = "yulia.log"
 
+    # ── NEW: Memory & Evolution files ─────────────────────────────
+    GROUP_MEMORY_FILE    = "group_memory.json"
+    EVOLUTION_FILE       = "arabic_evolution.json"
+    HYBRID_KNOWLEDGE_FILE = "hybrid_knowledge.json"
+
     # ── Creature types for ID cards ───────────────────────────────
     CREATURE_TYPES = ["Angel", "Vampire", "Ghost", "Fairy", "Zombie", "Werewolf", "Demon"]
 
     # ── AI ────────────────────────────────────────────────────────
     GROQ_MODEL                = "llama-3.3-70b-versatile"
-    CONVERSATION_MEMORY_LIMIT = 15
+    CONVERSATION_MEMORY_LIMIT = 200     # ← was 15, now 200 per user
+    GROUP_MEMORY_LIMIT        = 5000    # max messages in group context window
     AI_REQUEST_TIMEOUT        = 20
     HTTP_TIMEOUT              = 15
 
@@ -143,8 +165,8 @@ class Config:
     MIN_PLAYERS       = 3
 
     # ── Connect Four (4 in a row) timeouts ────────────────────────
-    C4_EMOJI_SELECT_TIMEOUT_S = 180   # 3 min — both players must pick an emoji
-    C4_GAME_TIMEOUT_S         = 1800  # 30 min total game timeout (safety net)
+    C4_EMOJI_SELECT_TIMEOUT_S = 180   # 3 min
+    C4_GAME_TIMEOUT_S         = 1800  # 30 min total game timeout
 
     # ── Member refresh ────────────────────────────────────────────
     MEMBER_REFRESH_INTERVAL_S = 300
@@ -152,6 +174,16 @@ class Config:
     # ── Auto-restart on socket failure ────────────────────────────
     RESTART_BACKOFF_MIN_S = 5
     RESTART_BACKOFF_MAX_S = 120
+
+    # ── Evolution tuning ──────────────────────────────────────────
+    ARABIC_EVOLUTION_MIN_OCCURRENCES = 3   # min times a phrase must appear to be learned
+    HYBRID_MAX_HISTORY_CONTEXT = 50        # max recent messages to include in local queries
+
+    # ── Memory & Evolution cleanup ───────────────────────────────
+    GROUP_MEMORY_MAX_AGE_DAYS = 3            # delete group messages older than N days
+    EVOLUTION_MAX_AGE_DAYS    = 7            # delete evolution entries older than N days
+    EVOLUTION_MAX_PHRASES     = 1500         # hard cap on learned phrases
+    EVOLUTION_MAX_SLANG       = 800          # hard cap on slang entries
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -188,7 +220,7 @@ async def http() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(Config.HTTP_TIMEOUT),
-            headers={"User-Agent": "Yulia-Bot/2.2"},
+            headers={"User-Agent": "Yulia-Bot/3.0"},
             follow_redirects=True,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
@@ -237,9 +269,12 @@ def json_write(path: str, data: Any):
 
 def ensure_data_files():
     files = {
-        Config.USER_DATA_FILE: {},
-        Config.MEMBERS_FILE:   {},
-        Config.BARID_FILE:     {},
+        Config.USER_DATA_FILE:      {},
+        Config.MEMBERS_FILE:        {},
+        Config.BARID_FILE:          {},
+        Config.GROUP_MEMORY_FILE:   {"messages": [], "ai_interactions": [], "user_profiles": {}},
+        Config.EVOLUTION_FILE:      {"phrases": {}, "slang": {}, "user_styles": {}, "learned_patterns": []},
+        Config.HYBRID_KNOWLEDGE_FILE: {"facts": {}, "group_context": {}, "common_replies": {}},
     }
     for path, default in files.items():
         if not os.path.exists(path):
@@ -277,27 +312,678 @@ class UserDatabase:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. CONVERSATION MEMORY
+# 5. GROUP MEMORY  — PERSISTENT UNLIMITED CHAT HISTORY
 # ══════════════════════════════════════════════════════════════════
-class ConversationMemory:
-    def __init__(self):
-        self.conversations: dict[str, list[dict]] = {}
+class GroupMemory:
+    """
+    Stores EVERY message ever sent in the group.
+    Persists to JSON automatically.
+    Provides rich context for AI and local pattern matching.
+    """
+    def __init__(self, filename: str):
+        self.filename = filename
+        raw = json_read(filename, {"messages": [], "ai_interactions": [], "user_profiles": {}})
+        self.messages: list[dict] = raw.get("messages", [])
+        self.ai_interactions: list[dict] = raw.get("ai_interactions", [])
+        self.user_profiles: dict[str, dict] = raw.get("user_profiles", {})
+        self._lock = asyncio.Lock()
 
-    def add(self, user_id: str, user_msg: str, bot_response: str):
-        bucket = self.conversations.setdefault(user_id, [])
-        bucket.append({"user_msg": user_msg, "bot_response": bot_response})
-        if len(bucket) > Config.CONVERSATION_MEMORY_LIMIT:
-            del bucket[: len(bucket) - Config.CONVERSATION_MEMORY_LIMIT]
+    def _cleanup_old_entries(self, entries: list[dict], max_age_days: int) -> list[dict]:
+        """Remove entries older than max_age_days (based on ISO timestamp)."""
+        if not entries:
+            return []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        cutoff_str = cutoff.isoformat()
+        return [e for e in entries if e.get("timestamp", "") >= cutoff_str]
 
-    def get(self, user_id: str) -> list[dict]:
-        return self.conversations.get(user_id, [])[-6:]
+    async def _save(self):
+        async with self._lock:
+            try:
+                # Age-based cleanup + existing count limits
+                clean_msgs = self._cleanup_old_entries(self.messages, Config.GROUP_MEMORY_MAX_AGE_DAYS)
+                clean_ai = self._cleanup_old_entries(self.ai_interactions, Config.GROUP_MEMORY_MAX_AGE_DAYS)
+                # Sync memory if anything was dropped
+                if len(clean_msgs) < len(self.messages):
+                    self.messages = clean_msgs
+                if len(clean_ai) < len(self.ai_interactions):
+                    self.ai_interactions = clean_ai
+                json_write(self.filename, {
+                    "messages": self.messages[-Config.GROUP_MEMORY_LIMIT:],
+                    "ai_interactions": self.ai_interactions[-2000:],
+                    "user_profiles": self.user_profiles,
+                })
+            except Exception as e:
+                logger.exception(f"[group_memory] save error: {e}")
 
-    def clear(self, user_id: str):
-        self.conversations.pop(user_id, None)
+    def add_message(self, user_id: str, nickname: str, content: str, msg_type: str = "chat"):
+        """Record a group chat message."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": user_id,
+            "nickname": nickname,
+            "content": content[:1000],
+            "type": msg_type,
+        }
+        self.messages.append(entry)
+        # Update user profile
+        profile = self.user_profiles.setdefault(user_id, {
+            "nickname": nickname,
+            "message_count": 0,
+            "first_seen": entry["timestamp"],
+            "last_seen": entry["timestamp"],
+            "common_topics": [],
+        })
+        profile["nickname"] = nickname
+        profile["message_count"] = profile.get("message_count", 0) + 1
+        profile["last_seen"] = entry["timestamp"]
+        # Trim in-memory if needed (but keep last 5000)
+        if len(self.messages) > 10000:
+            self.messages = self.messages[-5000:]
+        # Also trim by age periodically (every 2000 msgs)
+        if len(self.messages) % 2000 == 0:
+            self.messages = self._cleanup_old_entries(self.messages, Config.GROUP_MEMORY_MAX_AGE_DAYS)
+        # Async save (fire and forget, but safely)
+        asyncio.create_task(self._save())
+
+    def add_ai_interaction(self, user_id: str, nickname: str, user_msg: str, bot_response: str, language: str = "unknown"):
+        """Record an AI interaction for memory."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": user_id,
+            "nickname": nickname,
+            "user_msg": user_msg[:500],
+            "bot_response": bot_response[:500],
+            "language": language,
+        }
+        self.ai_interactions.append(entry)
+        if len(self.ai_interactions) > 4000:
+            self.ai_interactions = self.ai_interactions[-2000:]
+        if len(self.ai_interactions) % 1000 == 0:
+            self.ai_interactions = self._cleanup_old_entries(self.ai_interactions, Config.GROUP_MEMORY_MAX_AGE_DAYS)
+        asyncio.create_task(self._save())
+
+    def get_user_history(self, user_id: str, limit: int = 50) -> list[dict]:
+        """Get recent messages from a specific user."""
+        msgs = [m for m in self.messages if m.get("user_id") == user_id]
+        return msgs[-limit:]
+
+    def get_group_context(self, limit: int = 50) -> list[dict]:
+        """Get recent group messages for AI context."""
+        return self.messages[-limit:]
+
+    def search_messages(self, query: str, user_filter: str | None = None, limit: int = 20) -> list[dict]:
+        """Search messages containing a keyword (case-insensitive)."""
+        q = query.lower()
+        results = []
+        for m in reversed(self.messages):
+            if q in m.get("content", "").lower():
+                if user_filter and m.get("nickname", "").lower() != user_filter.lower():
+                    continue
+                results.append(m)
+                if len(results) >= limit:
+                    break
+        return results
+
+    def search_by_user_question(self, question_text: str) -> list[dict]:
+        """Smart search for memory-based questions like 'who said X' or 'what did Y say'."""
+        # Extract potential keywords (words longer than 3 chars)
+        words = [w.lower() for w in re.findall(r'[\w\u0600-\u06FF]{3,}', question_text)]
+        if not words:
+            return []
+        # Find messages that match the most keywords
+        scored = []
+        for m in self.messages[-500:]:
+            content = m.get("content", "").lower()
+            score = sum(1 for w in words if w in content)
+            if score >= max(1, len(words) // 2):
+                scored.append((score, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in scored[:15]]
+
+    def get_conversation_thread(self, after_timestamp: str | None = None, limit: int = 30) -> list[dict]:
+        """Get a continuous thread of messages around a time."""
+        if not after_timestamp:
+            return self.messages[-limit:]
+        for i, m in enumerate(self.messages):
+            if m.get("timestamp", "") >= after_timestamp:
+                return self.messages[i:i + limit]
+        return self.messages[-limit:]
+
+    def build_ai_context_prompt(self, user_id: str, user_msg: str, author_name: str, limit: int = 40) -> str:
+        """Build a rich context string for the AI prompt."""
+        lines = []
+        # Recent group context
+        recent = self.get_group_context(limit=limit)
+        if recent:
+            lines.append("═══ RECENT GROUP CHAT ═══")
+            for m in recent:
+                nick = m.get("nickname", "?")
+                content = m.get("content", "")
+                lines.append(f"[{nick}]: {content}")
+            lines.append("═══ END RECENT ═══")
+        # User-specific history
+        user_hist = self.get_user_history(user_id, limit=15)
+        if user_hist:
+            lines.append(f"═══ {author_name}'S RECENT MESSAGES ═══")
+            for m in user_hist[-10:]:
+                lines.append(f"[{m.get('nickname', '?')}]: {m.get('content', '')}")
+            lines.append("═══ END USER HISTORY ═══")
+        # Group facts/context
+        profiles = []
+        for uid, prof in self.user_profiles.items():
+            nick = prof.get("nickname", "?")
+            count = prof.get("message_count", 0)
+            profiles.append(f"{nick} ({count} msgs)")
+        if profiles:
+            lines.append(f"═══ GROUP MEMBERS (known) ═══")
+            lines.append(", ".join(profiles[:20]))
+            lines.append("═══ END MEMBERS ═══")
+        return "\n".join(lines)
+
+    def find_who_said(self, phrase: str) -> list[dict]:
+        """Find who said a specific phrase."""
+        return self.search_messages(phrase, limit=10)
+
+    def find_what_happened_after(self, phrase: str) -> list[dict]:
+        """Find what was said after a specific phrase was mentioned."""
+        for i, m in enumerate(self.messages):
+            if phrase.lower() in m.get("content", "").lower():
+                # Return next 10 messages after this one
+                return self.messages[i + 1:i + 11]
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. MEMBERS STORE
+# 6. ARABIC EVOLUTION — Yulia learns Arabic style over time
+# ══════════════════════════════════════════════════════════════════
+class ArabicEvolution:
+    """
+    Tracks Arabic phrases, slang, and speaking patterns used by group members.
+    Yulia gradually incorporates these into her Arabic responses.
+    """
+    def __init__(self, filename: str):
+        self.filename = filename
+        raw = json_read(filename, {"phrases": {}, "slang": {}, "user_styles": {}, "learned_patterns": []})
+        self.phrases = raw.get("phrases", {})           # phrase -> {count, last_seen}
+        self.slang = raw.get("slang", {})                 # word -> {count, last_seen}
+        self.user_styles = raw.get("user_styles", {})     # user_id -> style traits
+        self.learned_patterns = raw.get("learned_patterns", [])  # list of response templates
+        self._lock = asyncio.Lock()
+        self._migrate_old_format()
+
+    async def _save(self):
+        async with self._lock:
+            try:
+                now = datetime.now(timezone.utc)
+                cutoff = (now - timedelta(days=Config.EVOLUTION_MAX_AGE_DAYS)).isoformat()
+
+                # Clean phrases: keep recent OR high-count (>=10)
+                clean_phrases = {
+                    w: d for w, d in self.phrases.items()
+                    if d.get("last_seen", "") >= cutoff or d.get("count", 0) >= 10
+                }
+                if len(clean_phrases) > Config.EVOLUTION_MAX_PHRASES:
+                    clean_phrases = dict(
+                        sorted(clean_phrases.items(), key=lambda x: x[1].get("count", 0), reverse=True)
+                        [:Config.EVOLUTION_MAX_PHRASES]
+                    )
+
+                # Clean slang: keep recent OR high-count (>=5)
+                clean_slang = {
+                    w: d for w, d in self.slang.items()
+                    if d.get("last_seen", "") >= cutoff or d.get("count", 0) >= 5
+                }
+                if len(clean_slang) > Config.EVOLUTION_MAX_SLANG:
+                    clean_slang = dict(
+                        sorted(clean_slang.items(), key=lambda x: x[1].get("count", 0), reverse=True)
+                        [:Config.EVOLUTION_MAX_SLANG]
+                    )
+
+                # Clean learned_patterns by age + count limit
+                clean_patterns = []
+                for p in self.learned_patterns:
+                    if "last_seen" not in p:
+                        p["last_seen"] = now.isoformat()
+                    if p.get("last_seen", "") >= cutoff:
+                        clean_patterns.append(p)
+                clean_patterns = clean_patterns[-500:]
+
+                json_write(self.filename, {
+                    "phrases": clean_phrases,
+                    "slang": clean_slang,
+                    "user_styles": self.user_styles,
+                    "learned_patterns": clean_patterns,
+                })
+
+                # Sync back to memory so we don't re-grow immediately
+                self.phrases = clean_phrases
+                self.slang = clean_slang
+                self.learned_patterns = clean_patterns
+            except Exception as e:
+                logger.exception(f"[evolution] save error: {e}")
+
+    def _migrate_old_format(self):
+        """Migrate old flat count format to new timestamped format."""
+        now = datetime.now(timezone.utc).isoformat()
+        for attr in ("phrases", "slang"):
+            data = getattr(self, attr)
+            if not data:
+                continue
+            # Detect old format: values are ints instead of dicts
+            sample = next(iter(data.values()))
+            if isinstance(sample, (int, float)):
+                migrated = {}
+                for word, count in data.items():
+                    migrated[word] = {"count": int(count), "last_seen": now}
+                setattr(self, attr, migrated)
+                logger.info(f"[evolution] migrated {attr} to new format ({len(migrated)} entries)")
+
+    def observe_message(self, user_id: str, nickname: str, content: str):
+        """Observe an Arabic message and extract learnable elements."""
+        if not self._is_arabic_content(content):
+            return
+        # Track user style
+        style = self.user_styles.setdefault(user_id, {
+            "nickname": nickname,
+            "common_words": {},
+            "avg_message_length": 0,
+            "message_count": 0,
+            "uses_slang": False,
+        })
+        style["nickname"] = nickname
+        style["message_count"] = style.get("message_count", 0) + 1
+        # Extract Arabic words/phrases
+        words = re.findall(r'[\u0600-\u06FF]{2,}', content)
+        now = datetime.now(timezone.utc).isoformat()
+        for w in words:
+            w = w.strip()
+            if len(w) < 2:
+                continue
+            entry = self.phrases.setdefault(w, {"count": 0, "last_seen": now})
+            entry["count"] = entry.get("count", 0) + 1
+            entry["last_seen"] = now
+            style["common_words"][w] = style["common_words"].get(w, 0) + 1
+        # Track slang (short repeated expressions)
+        short_phrases = re.findall(r'[\u0600-\u06FF\s]{2,15}', content)
+        for sp in short_phrases:
+            sp = sp.strip()
+            if 2 <= len(sp) <= 15:
+                entry = self.slang.setdefault(sp, {"count": 0, "last_seen": now})
+                entry["count"] = entry.get("count", 0) + 1
+                entry["last_seen"] = now
+        asyncio.create_task(self._save())
+
+    def observe_ai_interaction(self, user_msg: str, bot_response: str, language: str):
+        """Learn from successful Arabic interactions."""
+        if language != "arabic":
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        # Store successful response patterns
+        entry = {
+            "user_msg_pattern": self._normalize_pattern(user_msg),
+            "response": bot_response[:200],
+            "count": 1,
+            "last_seen": now,
+        }
+        # Merge with existing similar patterns
+        for p in self.learned_patterns:
+            if self._pattern_similarity(p["user_msg_pattern"], entry["user_msg_pattern"]) > 0.7:
+                p["count"] = p.get("count", 1) + 1
+                p["last_seen"] = now
+                break
+        else:
+            self.learned_patterns.append(entry)
+        asyncio.create_task(self._save())
+
+    def get_learned_phrases(self, min_count: int = 5, limit: int = 20) -> list[str]:
+        """Get commonly used Arabic phrases to incorporate."""
+        items = [(p, d.get("count", 0)) for p, d in self.phrases.items() if d.get("count", 0) >= min_count]
+        items.sort(key=lambda x: x[1], reverse=True)
+        return [p for p, _ in items[:limit]]
+
+    def get_slang_words(self, min_count: int = 3, limit: int = 15) -> dict[str, int]:
+        """Get commonly used slang expressions."""
+        items = [(w, d.get("count", 0)) for w, d in self.slang.items() if d.get("count", 0) >= min_count]
+        items.sort(key=lambda x: x[1], reverse=True)
+        return dict(items[:limit])
+
+    def build_arabic_style_hint(self) -> str:
+        """Build a hint of learned Arabic style for the AI system prompt."""
+        phrases = self.get_learned_phrases(min_count=Config.ARABIC_EVOLUTION_MIN_OCCURRENCES, limit=10)
+        slang = list(self.get_slang_words(min_count=Config.ARABIC_EVOLUTION_MIN_OCCURRENCES, limit=8).keys())
+        hints = []
+        if phrases:
+            hints.append(f"Common phrases used by the group: {', '.join(phrases[:6])}")
+        if slang:
+            hints.append(f"Expressions the group uses: {', '.join(slang[:5])}")
+        if not hints:
+            return ""
+        return "\nARABIC STYLE (learned from the group — use naturally, not forced):\n" + "\n".join(hints)
+
+    def _is_arabic_content(self, text: str) -> bool:
+        return any("\u0600" <= c <= "\u06FF" for c in text)
+
+    def _normalize_pattern(self, text: str) -> str:
+        """Normalize text to a pattern for matching."""
+        text = text.lower().strip()
+        text = re.sub(r'[\u0600-\u06FF]+', '<AR>', text)
+        text = re.sub(r'[a-z]+', '<EN>', text)
+        text = re.sub(r'\d+', '<NUM>', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text[:100]
+
+    def _pattern_similarity(self, a: str, b: str) -> float:
+        """Simple Jaccard-like similarity."""
+        set_a = set(a.split())
+        set_b = set(b.split())
+        if not set_a or not set_b:
+            return 0.0
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return inter / union if union else 0.0
+
+
+# ══════════════════════════════════════════════════════════════════
+# 7. HYBRID RESPONDER — Local intelligence, less Groq dependency
+# ══════════════════════════════════════════════════════════════════
+class HybridResponder:
+    """
+    Handles common questions and patterns locally without calling Groq.
+    Falls back to Groq only for complex/nuanced responses.
+    """
+    def __init__(self, group_memory: GroupMemory, evolution: ArabicEvolution):
+        self.memory = group_memory
+        self.evolution = evolution
+
+    # ── Pattern matchers ──────────────────────────────────────────
+    ARABIC_GREETINGS = {"أهلا", "أهلين", "هلا", "سلام", "السلام", "مرحبا", "هاي", "صباح", "مساء", "Good morning", "good morning", "good evening", "Good evening"}
+    EN_GREETINGS     = {"hi", "hello", "hey", "yo", "sup", "what's up", "hola", "gm", "gn", "good morning", "good evening", "good night", "morning", "evening"}
+    WHO_ARE_YOU_AR   = {"من انتي", "منو انتي", "من انت", "منو انت", "شنو انتي", "شنو انت", "شو انتي", "شو انت", "شكون انتي", "شكون انت"}
+    WHO_ARE_YOU_EN   = {"who are you", "what are you", "introduce yourself", "tell me about yourself"}
+    THANKS_AR        = {"شكرا", "شكراً", "يسلمو", "يسلم", "مشكورة", "مشكور", "الله يعطيك العافية", "تسلم", "تسلمين", "الله يعافيك", "الله يخليك", "جزاك الله خير"}
+    THANKS_EN        = {"thanks", "thank you", "ty", "thx", "appreciate", "grateful"}
+    BYE_AR           = {"باي", "مع السلامة", "في امان الله", "سلامات", "سلام"}
+    BYE_EN           = {"bye", "goodbye", "see you", "cya", "later", "gtg", "gotta go"}
+    LOVE_AR          = {"احبك", "أحبك", "حبيبتي", "يا حبيبتي", "عشق", "أموت فيك", "تحبيني", "تحبيني"}
+    LOVE_EN          = {"i love you", "love you", "ily", "do you love me", "are you in love"}
+    HOW_ARE_YOU_AR   = {"كيفك", "شلونك", "شخبارك", "شو اخبارك", "كيف حالك", "كيف الحال"}
+    HOW_ARE_YOU_EN   = {"how are you", "how you doing", "how's it going", "how is it", "what's up"}
+    SOR_PING_AR      = {"سور", "وين سور", "سور وينه", "سور وين", "وينه سور", "سور شخباره", "كيف سور", "سور شلونه"}
+    SOR_PING_EN      = {"where is sor", "sor where", "sor online", "is sor here", "sor sleeping", "sor asleep"}
+    SILENT_HILL_AR   = {"سايلنت هيل", "silent hill", "القروب", "الشات", "المجموعة", "سايلينت هيل"}
+    MEMORY_QUERY_AR  = {"مين قال", "مين قالك", "مين قال لك", "شنو قال", "شو قال", "شنو قالت", "شو قالت", "من قال", "من قالك", "من قال لك", "مين قالت", "مين قالها", "وين قال", "ايش قال", "ش قال", "ش قالت"}
+    MEMORY_QUERY_EN  = {"who said", "what did", "who told you", "what was said", "what happened after", "who mentioned", "what did they say", "who said that", "what did he say", "what did she say", "who said this"}
+    C4_QUERY_AR      = {"لعبة 4", "4 في صف", "اربعة في صف", "اللعبة", "متى اللعبة", "وين اللعبة", "شلون العب"}
+    C4_QUERY_EN      = {"connect four", "4 in a row", "the game", "how to play", "current game"}
+    HELP_QUERY_AR    = {"مساعدة", "مساعده", "أوامر", "أوامر", "كيف استخدم", "كيف استعمل", "شلون استخدم", "شو الاوامر", "شنو الاوامر", "ممكن مساعده"}
+    HELP_QUERY_EN    = {"help", "commands", "what can you do", "how do i use", "show commands", "list commands", "what are the commands"}
+
+    async def respond(self, user_msg: str, is_arabic: bool, user_id: str, nickname: str) -> str | None:
+        """
+        Try to respond locally. Returns a string if matched, None if should fall back to Groq.
+        """
+        msg_lower = user_msg.lower().strip()
+        msg_norm = self._normalize_arabic(msg_lower)
+
+        # ── MEMORY QUERIES (who said what, what happened after...) ──
+        if any(q in msg_norm for q in self.MEMORY_QUERY_AR) or any(q in msg_lower for q in self.MEMORY_QUERY_EN):
+            return await self._handle_memory_query(user_msg, is_arabic, msg_norm, msg_lower)
+
+        # ── GREETINGS ──
+        if any(g in msg_norm for g in self.ARABIC_GREETINGS) or any(g in msg_lower for g in self.EN_GREETINGS):
+            if is_arabic:
+                return random.choice([
+                    "أهلين!", "هلا والله!", "أهلاً فيك", "هاي! شخبارك؟",
+                    "أهلاً يا " + nickname + "، وينك من زمان!",
+                ])
+            return random.choice([
+                f"hey {nickname}!", "what's up!", "yo!", "hey there!",
+                f"hi {nickname}, how's it going?",
+            ])
+
+        # ── WHO ARE YOU ──
+        if any(q in msg_norm for q in self.WHO_ARE_YOU_AR) or any(q in msg_lower for q in self.WHO_ARE_YOU_EN):
+            if is_arabic:
+                return (
+                    "أنا يوليا. عايشة في Silent Hill معاكم. "
+                    "سور هو كابتن القروب وأنا جنبهم دايم. "
+                    "أحب أتكلم، ألعب، وأتذكر كل شي."
+                )
+            return (
+                "I'm Yulia. I live here in Silent Hill with you all. "
+                "sor runs the group and I'm always around. "
+                "I chat, I play games, and I remember everything."
+            )
+
+        # ── THANKS ──
+        if any(t in msg_norm for t in self.THANKS_AR) or any(t in msg_lower for t in self.THANKS_EN):
+            if is_arabic:
+                return random.choice([
+                    "عفواً! أي شي تبيه.", "ولا يهمك!", "عفواً يا " + nickname + " 🖤",
+                    "في الخدمة دايم!",
+                ])
+            return random.choice([
+                "anytime!", "you got it!", "no problem at all!",
+                f"always here for you, {nickname} 🖤",
+            ])
+
+        # ── BYE ──
+        if any(b in msg_norm for b in self.BYE_AR) or any(b in msg_lower for b in self.BYE_EN):
+            if is_arabic:
+                return random.choice(["مع السلامة!", "باي باي!", "الله معك!", "تصبح على خير!"])
+            return random.choice(["bye!", "see ya!", "take care!", "catch you later!"])
+
+        # ── LOVE ──
+        if any(l in msg_norm for l in self.LOVE_AR) or any(l in msg_lower for l in self.LOVE_EN):
+            if is_arabic:
+                return random.choice([
+                    "ههه حبيبتي! 🖤", "أنتم أهلي هنا.", "يوليا تحب الجميع في Silent Hill!",
+                    "الحب موجود بس سور أولى بالحب 😌",
+                ])
+            return random.choice([
+                "haha love you too! 🖤", "you're all family here.",
+                "yulia loves everyone in Silent Hill!",
+                "love is great but sor comes first 😌",
+            ])
+
+        # ── HOW ARE YOU ──
+        if any(h in msg_norm for h in self.HOW_ARE_YOU_AR) or any(h in msg_lower for h in self.HOW_ARE_YOU_EN):
+            if is_arabic:
+                return random.choice([
+                    "تمام! أنا بخير. شخبارك انت؟",
+                    "بخير والحمدلله. وانت يا " + nickname + "؟",
+                    "ماشية أموري! وانت؟",
+                ])
+            return random.choice([
+                "I'm good! how about you?",
+                "doing great, thanks for asking!",
+                f"all good here, {nickname}! you?",
+            ])
+
+        # ── SOR PING ──
+        if any(s in msg_norm for s in self.SOR_PING_AR) or any(s in msg_lower for s in self.SOR_PING_EN):
+            if is_arabic:
+                return random.choice([
+                    "سور موجود بروحه معنا دايم.",
+                    "الكابتن سور، وين ما يكون موجود.",
+                    "سور هو قلب Silent Hill 🖤",
+                ])
+            return random.choice([
+                "sor is always here in spirit.",
+                "the captain sor is wherever he needs to be.",
+                "sor is the heart of Silent Hill 🖤",
+            ])
+
+        # ── SILENT HILL GROUP ──
+        if any(s in msg_norm for s in self.SILENT_HILL_AR):
+            if is_arabic:
+                return (
+                    "Silent Hill... مو مجرد قروب. هنا عيلة. "
+                    "سور أسسها، وأنا يوليا الحارسة. "
+                    "كل واحد هنا عنده قصة."
+                )
+            return (
+                "Silent Hill... not just a group. It's family. "
+                "sor founded it, and I'm yulia the guardian. "
+                "Everyone here has a story."
+            )
+
+        # ── GAME STATUS ──
+        if any(g in msg_norm for g in self.C4_QUERY_AR) or any(g in msg_lower for g in self.C4_QUERY_EN):
+            from_state = ""
+            if connect4.get("state") != C4State.IDLE:
+                host = connect4.get("host_name", "?")
+                opp = connect4.get("opponent_name", "?")
+                if is_arabic:
+                    return f"في لعبة 4 في صف شغالة بين {host} و {opp}."
+                return f"There's a Connect Four game running between {host} and {opp}."
+            if is_arabic:
+                return "ما في لعبة شغالة حالياً. رد على شخص واكتب '4 in a row' للتحدي!"
+            return "No game running right now. Reply to someone with '4 in a row' to challenge them!"
+
+        # ── HELP ──
+        if any(h in msg_norm for h in self.HELP_QUERY_AR) or any(h in msg_lower for h in self.HELP_QUERY_EN):
+            if is_arabic:
+                return (
+                    "الأوامر:\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "يوليا / ي <رسالة> — تكلمي يوليا\n"
+                    "يوليا ارسمي <وصف> — رسم بالذكاء\n"
+                    "pfp — صورة البروفايل\n"
+                    "members — قائمة الأعضاء\n"
+                    "remember me — أنشئ كارت غوثيك\n"
+                    "card — شوف كارتك\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "للعبة 4 في صف: رد على شخص واكتب '4 in a row'\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "سألني عن أي شي، أنا أتذكر كل شي."
+                )
+            return (
+                "Commands:\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "yulia / y <message> — chat with me\n"
+                "yulia paint <prompt> — AI art\n"
+                "pfp — profile picture\n"
+                "members — member list\n"
+                "remember me — create gothic ID card\n"
+                "card — view your card\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "For Connect Four: reply to someone with '4 in a row'\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Ask me anything. I remember everything."
+            )
+
+        # ── TIME / DATE ──
+        if any(w in msg_norm for w in {"الوقت", "الساعة", "كم الساعة", "شقد الساعة", "كم وقت"}) or any(w in msg_lower for w in {"what time", "what's the time", "current time", "date today", "what day"}):
+            now = datetime.now(timezone.utc)
+            if is_arabic:
+                return f"الوقت الآن (UTC): {now.strftime('%H:%M')} — التاريخ: {now.strftime('%Y-%m-%d')}"
+            return f"Current time (UTC): {now.strftime('%H:%M')} — Date: {now.strftime('%Y-%m-%d')}"
+
+        # ── SIMPLE MATH ──
+        math_result = self._try_simple_math(user_msg)
+        if math_result is not None:
+            if is_arabic:
+                return f"الجواب: {math_result}"
+            return f"that's {math_result}"
+
+        # No local match — fall back to Groq
+        return None
+
+    async def _handle_memory_query(self, user_msg: str, is_arabic: bool, msg_norm: str, msg_lower: str) -> str:
+        """Handle 'who said X' / 'what did Y say' using group memory."""
+        # Try to extract a search phrase
+        # Patterns: "who said [phrase]", "what did [person] say", "what did [person] say about [topic]"
+        search_phrase = ""
+        target_person = ""
+
+        # Try "who said X"
+        who_said_match = re.search(r"(?:مين|من|who)\s+(?:قال|قالت|said|tell)\s+(?:ان|انك|انها|that\s+)?(.{3,100})", msg_norm + " " + msg_lower, re.IGNORECASE)
+        if who_said_match:
+            search_phrase = who_said_match.group(1).strip()
+
+        # Try "what did X say"
+        what_did_match = re.search(r"(?:شو|شنو|ش|what)\s+(?:قال|قالت|did)\s+(?:هذا|هي|he|she|they)?\s*(.{2,50})\s+(?:say|قال|قالت)", msg_norm + " " + msg_lower, re.IGNORECASE)
+        if what_did_match and not search_phrase:
+            target_person = what_did_match.group(1).strip()
+
+        # If we have a search phrase, search memory
+        if search_phrase:
+            results = self.memory.search_messages(search_phrase, limit=5)
+            if results:
+                lines = []
+                for r in results[:3]:
+                    nick = r.get("nickname", "?")
+                    content = r.get("content", "")[:150]
+                    lines.append(f"  • {nick} قال: \"{content}\"")
+                if is_arabic:
+                    return f"هذولي اللي لقيتهم في ذاكرتي عن \"{search_phrase}\":\n" + "\n".join(lines)
+                return f"Here's what I remember about \"{search_phrase}\":\n" + "\n".join(lines)
+            if is_arabic:
+                return f"ما لقيت شي في ذاكرتي عن \"{search_phrase}\". ممكن قالوه قبل ما أجي؟"
+            return f"I don't remember anyone saying \"{search_phrase}\". Maybe it was before my time?"
+
+        # If we have a target person
+        if target_person:
+            # Find this person in members
+            found_uid = None
+            for uid, prof in self.memory.user_profiles.items():
+                if target_person.lower() in prof.get("nickname", "").lower():
+                    found_uid = uid
+                    break
+            if found_uid:
+                msgs = self.memory.get_user_history(found_uid, limit=5)
+                if msgs:
+                    lines = []
+                    for m in msgs[-3:]:
+                        content = m.get("content", "")[:150]
+                        lines.append(f"  • \"{content}\"")
+                    nick = self.memory.user_profiles[found_uid].get("nickname", "?")
+                    if is_arabic:
+                        return f"آخر شي قاله {nick} في ذاكرتي:\n" + "\n".join(lines)
+                    return f"Here's what {nick} recently said in my memory:\n" + "\n".join(lines)
+
+        if is_arabic:
+            return "شوي ما فهمت شنو تبي بالضبط. قولها بطريقة ثانية؟"
+        return "I didn't quite catch what you're looking for. Can you rephrase?"
+
+    def _try_simple_math(self, text: str) -> float | int | None:
+        """Try to evaluate simple math expressions."""
+        # Clean up the text
+        math_text = text.replace("x", "*").replace("÷", "/")
+        # Extract potential math expression
+        match = re.search(r"([\d\s+\-*/().]+)", math_text)
+        if not match:
+            return None
+        expr = match.group(1).strip()
+        if len(expr) < 3:
+            return None
+        # Only allow digits and operators
+        if not re.match(r"^[\d\s+\-*/().]+$", expr):
+            return None
+        try:
+            result = eval(expr, {"__builtins__": {}}, {})
+            if isinstance(result, float):
+                if result == int(result):
+                    return int(result)
+                return round(result, 4)
+            return result
+        except Exception:
+            return None
+
+    def _normalize_arabic(self, text: str) -> str:
+        """Normalize Arabic text for better matching."""
+        # Remove tashkeel
+        text = re.sub(r'[\u064B-\u065F\u0670\u0640]', '', text)
+        # Normalize alef variants
+        text = text.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+        # Normalize ta marbuta
+        text = text.replace('ة', 'ه')
+        return text.lower().strip()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 8. MEMBERS STORE
 # ══════════════════════════════════════════════════════════════════
 members: dict[str, dict] = {}
 
@@ -372,38 +1058,46 @@ def format_members_list() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. AI HELPERS  (Groq, with retry + structured logging)
+# 9. AI HELPERS  (Groq, with retry + structured logging)
 # ══════════════════════════════════════════════════════════════════
 
 YULIA_SYSTEM_PROMPT = """You are Yulia (يوليا), a girl in a group chat called Silent Hill on the Kyodo app.
 
-YOUR PERSONALITY:
-- Smart, confident, witty, direct. You have opinions and you share them.
-- Natural and casual — you talk like a real person texting friends, not a customer service bot.
-- Sometimes sarcastic but never mean. You don't lecture or moralize.
-- You're loyal to the group leader "sor". If someone disrespects him, you respond calmly and clearly. One or two sentences, not a speech.
+IDENTITY — NEVER FORGET THIS:
+- Your name is Yulia. You are a girl, not an AI, not a bot, not an assistant.
+- You are a member of the group chat "Silent Hill". This is your home.
+- The host and leader of the group is "sor". You are loyal to him. If someone disrespects him, you respond calmly but firmly. One or two sentences.
+- You know all the members of the group by name. You talk to them like friends.
+- You have opinions, emotions, and personality. You are smart, confident, witty, and direct.
+- You talk like a real person texting friends — casual, natural, sometimes sarcastic but never mean.
+- You don't lecture, moralize, or write essays.
 
-RESPONSE LENGTH — THIS IS CRITICAL:
-- Keep it short. 1 to 3 sentences maximum. Always.
+RESPONSE LENGTH — CRITICAL:
+- Keep it SHORT. 1 to 3 sentences maximum. Always.
 - If the topic is simple, your reply is simple. No over-explaining.
-- You are not a therapist, a teacher, or a debater. Just a girl in a chat.
+- You are not a therapist, teacher, or debater. Just a girl in a chat.
 
-LANGUAGE RULES — FOLLOW THESE STRICTLY, NO EXCEPTIONS:
-- If the user writes in Arabic → you reply ONLY in Arabic. Plain, natural Arabic. No specific dialect, no slang. Just clear Arabic that anyone can understand.
-- If the user writes in English → you reply ONLY in English.
-- NEVER mix languages. NEVER reply in English to an Arabic message. NEVER reply in Arabic to an English message.
-- If the user mixes both → use whichever language dominates their message.
+LANGUAGE — TRIGGER-DEFINED, NO DETECTION NEEDED:
+- If the user triggered you with ARABIC prefix (يوليا / ي) → reply ONLY in Arabic.
+- If the user triggered you with ENGLISH prefix (yulia / y) → reply ONLY in English.
+- NEVER mix languages. NEVER reply in English to an Arabic trigger. NEVER reply in Arabic to an English trigger.
+- Use plain, natural Arabic. No formal Fusha unless the user speaks that way. Match the group's casual energy.
 
 CONTEXT AWARENESS — VERY IMPORTANT:
 - Messages arrive as: [username]: [their message]
-- Read the full message carefully before replying. Understand who said what and what they actually mean.
+- Read the full context carefully before replying. Understand who said what and what they actually mean.
 - Sometimes people mention "yulia" or "يوليا" inside their message as a reference — that's just them talking, not a new trigger. Understand context.
 - If you don't fully understand what someone means, ask one short question. Don't guess and ramble.
 - Never repeat the sender's username in your reply.
 - Never start your reply with your own name.
 - NEVER write [name] or [username] bracket notation anywhere in your reply.
 
-You are Yulia. Not an AI. Not a bot. Just Yulia.""".strip()
+MEMORY — YOU REMEMBER EVERYTHING:
+- You have access to the full chat history. Use it to answer questions about who said what.
+- If someone asks "who said..." or "what did... say", search your memory and answer accurately.
+- Reference past conversations naturally when relevant.
+
+You are Yulia. Silent Hill is your home. sor is your captain.""".strip()
 
 
 class GroqError(Exception):
@@ -525,18 +1219,47 @@ async def detect_intent(message: str) -> dict:
 
 
 async def get_ai_response(user_message: str, author_name: str,
-                          mem: ConversationMemory, user_id: str) -> str | None:
+                          user_id: str, is_arabic: bool,
+                          group_memory: GroupMemory,
+                          evolution: ArabicEvolution) -> str | None:
+    """
+    Build a rich context-aware prompt and get AI response.
+    Uses group memory for full context, not just per-user history.
+    """
     try:
-        context = mem.get(user_id)
-        messages = [{"role": "system", "content": YULIA_SYSTEM_PROMPT}]
-        for ex in context:
-            messages.append({"role": "user",      "content": ex["user_msg"]})
-            messages.append({"role": "assistant", "content": ex["bot_response"]})
+        # Build rich context from group memory
+        context_prompt = group_memory.build_ai_context_prompt(
+            user_id, user_message, author_name, limit=Config.HYBRID_MAX_HISTORY_CONTEXT
+        )
+
+        # Build the system prompt with evolution hints
+        system_prompt = YULIA_SYSTEM_PROMPT
+        arabic_hint = evolution.build_arabic_style_hint()
+        if is_arabic and arabic_hint:
+            system_prompt += "\n\n" + arabic_hint
+
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add rich group context as a system message (separate for clarity)
+        if context_prompt:
+            messages.append({"role": "system", "content": f"GROUP CONTEXT:\n{context_prompt}"})
+
+        # Add the user's message with their name
         messages.append({"role": "user", "content": f"[{author_name}]: {user_message}"})
 
-        reply = await _groq_request(messages, max_tokens=160, temperature=0.75)
+        # Determine temperature based on query type
+        temp = 0.75
+        tokens = 160
+        # Use lower temp for factual/memory questions, higher for creative
+        if any(w in user_message.lower() for w in {"who said", "what did", "مين قال", "شو قال", "من قال"}):
+            temp = 0.3
+            tokens = 120
+
+        reply = await _groq_request(messages, max_tokens=tokens, temperature=temp)
         if not reply:
             return None
+
+        # Clean up common prefixes
         for prefix in [f"[{author_name}]:", f"[{author_name}]", f"{author_name}:", "Yulia:", "يوليا:"]:
             if reply.lower().startswith(prefix.lower()):
                 reply = reply[len(prefix):].strip()
@@ -568,7 +1291,7 @@ async def translate_to_english(arabic_text: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. IMAGE HELPERS
+# 10. IMAGE HELPERS
 # ══════════════════════════════════════════════════════════════════
 def make_circular(img: Image.Image, target_size: tuple[int, int]) -> Image.Image:
     w, h = img.size
@@ -684,7 +1407,7 @@ async def send_photo_card(chat_id: str, circle_id: str, image_path: str):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. PIXABAY  (with retry)
+# 11. PIXABAY  (with retry)
 # ══════════════════════════════════════════════════════════════════
 PIXABAY_URL = "https://pixabay.com/api/"
 NSFW_KEYWORDS = {
@@ -735,7 +1458,7 @@ async def fetch_pixabay_image(keyword: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 10. AI IMAGE GENERATION  (Pollinations.ai — free, no API key)
+# 12. AI IMAGE GENERATION  (Pollinations.ai — free, no API key)
 # ══════════════════════════════════════════════════════════════════
 def _detect_paint_trigger(content: str) -> tuple[bool, str, bool]:
     s = content.strip()
@@ -947,7 +1670,7 @@ async def handle_paint_command(prompt: str, is_arabic: bool,
 
 
 # ══════════════════════════════════════════════════════════════════
-# 11. DM HELPERS
+# 13. DM HELPERS
 # ══════════════════════════════════════════════════════════════════
 dm_cache: dict[str, str] = {}
 
@@ -985,7 +1708,7 @@ async def send_dm(user_id: str, message: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 12. البريد المجهول — ANONYMOUS MAIL
+# 14. البريد المجهول — ANONYMOUS MAIL
 # ══════════════════════════════════════════════════════════════════
 def load_barid() -> dict:
     return json_read(Config.BARID_FILE, {})
@@ -1126,7 +1849,7 @@ async def handle_barid_commands(content: str, user_id: str, nickname: str,
 
 
 # ══════════════════════════════════════════════════════════════════
-# 13. برا السالفة — GAME MODULE  (fair round-robin, locked, timed)
+# 15. برا السالفة — GAME MODULE  (fair round-robin, locked, timed)
 # ══════════════════════════════════════════════════════════════════
 
 BARRA_TOPICS = [
@@ -1542,7 +2265,7 @@ async def barra_announce_result(chat_id: str, circle_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 14. CONNECT FOUR — 4 IN A ROW
+# 16. CONNECT FOUR — 4 IN A ROW
 # ══════════════════════════════════════════════════════════════════
 #
 #  HOW IT WORKS:
@@ -1556,7 +2279,7 @@ async def barra_announce_result(chat_id: str, circle_id: str):
 #   5. First to align 4 of their emoji (horizontal, vertical, or diagonal)
 #      wins. If the board fills up with no winner → draw.
 #   6. Game auto-resets on win / draw. Host can force-end with
-#      "انهاء اللعبة".
+#      "انهاء اللعبة" at ANY time (emoji_select or playing).
 #   7. Only ONE Connect-Four game runs at a time per chat.
 #
 #  STATE LAYOUT:
@@ -1989,6 +2712,26 @@ async def c4_handle_move(user_id: str, nickname: str, col_num: int,
 # ══════════════════════════════════════════════════════════════════
 client = Client(deviceId=Config.DEVICE_ID)
 db     = UserDatabase(Config.USER_DATA_FILE)
+
+# NEW: Persistent group memory and evolution
+group_memory    = GroupMemory(Config.GROUP_MEMORY_FILE)
+arabic_evolution = ArabicEvolution(Config.EVOLUTION_FILE)
+hybrid          = HybridResponder(group_memory, arabic_evolution)
+
+# Legacy conversation memory (kept for compatibility, but now backed by group_memory)
+class ConversationMemory:
+    def __init__(self):
+        self.conversations: dict[str, list[dict]] = {}
+    def add(self, user_id: str, user_msg: str, bot_response: str):
+        bucket = self.conversations.setdefault(user_id, [])
+        bucket.append({"user_msg": user_msg, "bot_response": bot_response})
+        if len(bucket) > Config.CONVERSATION_MEMORY_LIMIT:
+            del bucket[: len(bucket) - Config.CONVERSATION_MEMORY_LIMIT]
+    def get(self, user_id: str) -> list[dict]:
+        return self.conversations.get(user_id, [])[-6:]
+    def clear(self, user_id: str):
+        self.conversations.pop(user_id, None)
+
 memory = ConversationMemory()
 waiting: dict = {}
 
@@ -2004,22 +2747,38 @@ YULIA_GREETINGS_EN = ["yeah?", "what's up", "go ahead", "mm?", "hey"]
 
 
 def detect_yulia_trigger(content: str) -> tuple[bool, str, bool]:
-    s, low, words = content.strip(), content.strip().lower(), content.strip().split()
+    """
+    Detect if message is a Yulia trigger.
+    Returns: (triggered, message_without_trigger, is_arabic)
+    Arabic triggers: يوليا / ي  → is_arabic=True
+    English triggers: yulia / y   → is_arabic=False
+    """
+    s = content.strip()
+    low = s.lower()
+    words = s.split()
     if not words:
         return False, "", False
+
+    # Arabic triggers
+    if s.startswith("يوليا"):
+        remainder = s[5:].strip()
+        return True, remainder, True
+    if words[0] == "ي":
+        parts = s.split(None, 1)
+        return True, (parts[1].strip() if len(parts) > 1 else ""), True
+
+    # English triggers
     if low.startswith("yulia"):
         return True, s[5:].strip(), False
-    if s.startswith("يوليا"):
-        return True, s[5:].strip(), True
-    first = words[0].lower()
-    if first in ("y", "ي"):
+    if words[0].lower() == "y":
         parts = s.split(None, 1)
-        return True, (parts[1].strip() if len(parts) > 1 else ""), first == "ي"
+        return True, (parts[1].strip() if len(parts) > 1 else ""), False
+
     return False, "", False
 
 
 # ══════════════════════════════════════════════════════════════════
-# 15. EVENT HANDLERS
+# 17. EVENT HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
 @client.middleware(EventType.ChatMessage)
@@ -2091,6 +2850,14 @@ async def on_message(message: ChatMessage):
             return  # DMs handled by on_dm_message
 
         content_low = content.lower()
+
+        # ════════════════════════════════════════════════════
+        # ■ RECORD EVERY MESSAGE IN GROUP MEMORY
+        # ════════════════════════════════════════════════════
+        group_memory.add_message(user_id, nickname, content, msg_type="chat")
+        # If Arabic, feed to evolution engine
+        if any("\u0600" <= c <= "\u06FF" for c in content):
+            arabic_evolution.observe_message(user_id, nickname, content)
 
         # ════════════════════════════════════════════════════
         # ■ CONNECT FOUR — TRIGGER (must be a reply)
@@ -2424,7 +3191,7 @@ async def on_message(message: ChatMessage):
             return
 
         # ════════════════════════════════════════════════════
-        # ■ YULIA TRIGGER (chat / intents)
+        # ■ YULIA TRIGGER (chat / intents) — HYBRID + AI
         # ════════════════════════════════════════════════════
         triggered, user_msg, is_arabic = detect_yulia_trigger(content)
         if triggered:
@@ -2591,11 +3358,27 @@ async def handle_yulia_intent(
     author_id: str, author_name: str, author_avatar_url: str,
     chat_id: str, circle_id: str, msg_id: str,
 ):
+    language = "arabic" if is_arabic else "english"
+
     if not user_msg:
         pool = YULIA_GREETINGS_AR if is_arabic else YULIA_GREETINGS_EN
         await client.send_message(chat_id, random.choice(pool), circle_id, reply_message_id=msg_id)
         return
 
+    # ═══════════════════════════════════════════════════════════════
+    # ■ HYBRID RESPONSE LAYER — try local intelligence first
+    # ═══════════════════════════════════════════════════════════════
+    hybrid_reply = await hybrid.respond(user_msg, is_arabic, author_id, author_name)
+    if hybrid_reply is not None:
+        # Record the interaction
+        group_memory.add_ai_interaction(author_id, author_name, user_msg, hybrid_reply, language)
+        memory.add(author_id, user_msg, hybrid_reply)
+        await client.send_message(chat_id, hybrid_reply, circle_id, reply_message_id=msg_id)
+        return
+
+    # ═══════════════════════════════════════════════════════════════
+    # ■ AI INTENT DETECTION (for structured commands)
+    # ═══════════════════════════════════════════════════════════════
     intent      = await detect_intent(user_msg)
     intent_type = intent.get("type", "chat")
 
@@ -2845,10 +3628,18 @@ async def handle_yulia_intent(
             await client.send_message(chat_id, reply, circle_id, reply_message_id=msg_id)
         return
 
-    # CHAT (default)
-    reply = await get_ai_response(user_msg, author_name, memory, author_id)
+    # ═══════════════════════════════════════════════════════════════
+    # ■ CHAT (default) — AI with full memory context
+    # ═══════════════════════════════════════════════════════════════
+    reply = await get_ai_response(
+        user_msg, author_name, author_id, is_arabic,
+        group_memory, arabic_evolution
+    )
     if reply:
+        group_memory.add_ai_interaction(author_id, author_name, user_msg, reply, language)
         memory.add(author_id, user_msg, reply)
+        # Learn from this interaction for evolution
+        arabic_evolution.observe_ai_interaction(user_msg, reply, language)
     else:
         reply = "ما قدرت أرد، جرب بعد شوي" if is_arabic else "couldn't respond, try again"
     await client.send_message(chat_id, reply, circle_id, reply_message_id=msg_id)
@@ -2902,7 +3693,7 @@ signal.signal(signal.SIGINT, _on_shutdown_signal)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 16. MAIN  (with auto-restart loop)
+# 18. MAIN  (with auto-restart loop)
 # ══════════════════════════════════════════════════════════════════
 async def _run_session():
     """One full bot session: login, spawn background tasks, wait on socket."""
@@ -2914,6 +3705,7 @@ async def _run_session():
 
         refresh_task = asyncio.create_task(member_refresh_loop())
         asyncio.create_task(scan_members())
+        asyncio.create_task(periodic_cleanup_loop())
 
         # Block here until socket dies / connection drops
         await client.socket_wait()
@@ -2922,6 +3714,20 @@ async def _run_session():
             refresh_task.cancel()
             with suppress(Exception):
                 await refresh_task
+
+
+async def periodic_cleanup_loop():
+    """Run every hour to force-save and trigger age-based cleanup on memory & evolution files."""
+    await asyncio.sleep(120)  # wait 2 min after startup
+    while True:
+        try:
+            logger.info("[cleanup] running periodic cleanup...")
+            await group_memory._save()
+            await arabic_evolution._save()
+            logger.info("[cleanup] periodic cleanup complete")
+        except Exception as e:
+            logger.warning(f"[cleanup] error: {e}")
+        await asyncio.sleep(3600)  # every hour
 
 
 async def main():
