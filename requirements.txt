@@ -5,7 +5,7 @@ Pillow>=10.0.0
 tenacity>=8.2.0
 flask
 emoji>=2.14.0
-kyodo>=1.5.2
+kyodo==1.5.2
 requests
 packaging
 google-genai
